@@ -1,0 +1,15 @@
+box_id: noob-orientation-server
+hosts:
+  - name: orientation-server
+    image: ctf-boxes/noob-orientation-server:latest
+    front_door: true
+    ports:
+      - {container_port: 22}
+      - {container_port: 21}
+      - {container_port: 80}
+    pasv_range:
+      container_min: 20000
+      container_max: 20010
+      env_min_var: PASV_MIN_PORT
+      env_max_var: PASV_MAX_PORT
+      env_address_var: PASV_ADDRESS

@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+docker
+pydantic
+pyyaml
+pytest
+requests
+httpx
