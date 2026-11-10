@@ -142,16 +142,13 @@ class DockerBackend(RuntimeBackend):
         # here: Docker's userland proxy accepts the handshake immediately
         # once the container exists, then resets the connection if it
         # can't reach a listener inside yet -- so a bare connect() can
-        # "succeed" well before the real service is actually up (hit this
-        # exact race: the test's HTTP GET got a connection reset even
-        # though a prior TCP connect had already reported success). For
-        # port 80, do a real HTTP probe instead; other ports fall back to
-        # TCP connect, which is still an improvement over no wait at all.
-        for port_num, container_port in front_door_all_host_ports:
-            if container_port == 80:
-                self._wait_for_http(config.DOCKER_HOST_PUBLIC_ADDRESS, port_num)
-            else:
-                self._wait_for_port(config.DOCKER_HOST_PUBLIC_ADDRESS, port_num)
+        # "succeed" well before the real service is actually up. This bit
+        # a non-80 HTTP front door (Intermediate's Flask app on 5000):
+        # connect() succeeded but the follow-up GET got a connection
+        # reset. Probe every port the same, protocol-agnostic way instead
+        # of special-casing port 80.
+        for port_num, _container_port in front_door_all_host_ports:
+            self._wait_for_service(config.DOCKER_HOST_PUBLIC_ADDRESS, port_num)
 
         return ProvisionResult(
             network_name=network_name,
@@ -160,34 +157,39 @@ class DockerBackend(RuntimeBackend):
             hosts=provisioned,
         )
 
-    def _wait_for_port(self, host: str, port: int, timeout_seconds: float = 30.0) -> None:
-        deadline = time.monotonic() + timeout_seconds
-        last_error: Exception | None = None
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection((host, port), timeout=1.0):
-                    return
-            except OSError as e:
-                last_error = e
-                time.sleep(0.5)
-        raise RuntimeError(f"front-door port {host}:{port} never accepted a connection within {timeout_seconds}s ({last_error})")
-
-    def _wait_for_http(self, host: str, port: int, timeout_seconds: float = 30.0) -> None:
+    def _wait_for_service(self, host: str, port: int, timeout_seconds: float = 30.0) -> None:
+        """Protocol-agnostic readiness probe. A plain TCP connect() is not
+        enough (see the race described above this method's call site) --
+        this requires an actual response from the listener behind the
+        connection: either a server-first banner (SSH/FTP send one
+        unprompted) or, if nothing arrives unprompted, a reply to a
+        generic HTTP GET. Either a reset while waiting for that response,
+        or getting no response from either probe, means try again."""
         deadline = time.monotonic() + timeout_seconds
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             try:
                 with socket.create_connection((host, port), timeout=1.0) as s:
-                    s.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
                     s.settimeout(1.0)
+                    try:
+                        data = s.recv(16)
+                        if data:
+                            return
+                        last_error = RuntimeError("connection closed with no data")
+                        time.sleep(0.5)
+                        continue
+                    except TimeoutError:
+                        pass  # no server-first banner -- try an HTTP probe below
+
+                    s.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
                     data = s.recv(16)
-                    if data.startswith(b"HTTP/"):
+                    if data:
                         return
-                    last_error = RuntimeError(f"unexpected response start: {data!r}")
+                    last_error = RuntimeError("connection accepted but no response to probe")
             except OSError as e:
                 last_error = e
             time.sleep(0.5)
-        raise RuntimeError(f"http port {host}:{port} never returned a valid response within {timeout_seconds}s ({last_error})")
+        raise RuntimeError(f"port {host}:{port} never produced a real response within {timeout_seconds}s ({last_error})")
 
     def _get_or_create_network(self, name: str, internal: bool = False):
         try:

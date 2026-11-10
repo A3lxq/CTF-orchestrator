@@ -1,0 +1,7 @@
+box_id: beginner-reading-room
+hosts:
+  - name: reading-room
+    image: ctf-boxes/beginner-reading-room:latest
+    front_door: true
+    ports:
+      - {container_port: 80}

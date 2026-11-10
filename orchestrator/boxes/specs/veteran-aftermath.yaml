@@ -1,0 +1,8 @@
+box_id: veteran-aftermath
+hosts:
+  - name: aftermath
+    image: ctf-boxes/veteran-aftermath:latest
+    front_door: true
+    ports:
+      - {container_port: 80}
+      - {container_port: 22}

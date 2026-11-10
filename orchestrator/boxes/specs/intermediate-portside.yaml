@@ -1,0 +1,7 @@
+box_id: intermediate-portside
+hosts:
+  - name: portside
+    image: ctf-boxes/intermediate-portside:latest
+    front_door: true
+    ports:
+      - {container_port: 5000}
