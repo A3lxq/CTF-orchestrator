@@ -1,0 +1,11 @@
+box_id: master-two-offices
+hosts:
+  - name: frontdesk
+    image: ctf-boxes/master-two-offices-frontdesk:latest
+    front_door: true
+    ports:
+      - {container_port: 5000}
+      - {container_port: 22}
+  - name: backoffice
+    image: ctf-boxes/master-two-offices-backoffice:latest
+    front_door: false

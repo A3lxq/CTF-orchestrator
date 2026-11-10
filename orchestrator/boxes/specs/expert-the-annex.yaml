@@ -1,0 +1,13 @@
+box_id: expert-the-annex
+hosts:
+  - name: gateway
+    image: ctf-boxes/expert-the-annex-gateway:latest
+    front_door: true
+    ports:
+      - {container_port: 5000}
+  - name: directory
+    image: ctf-boxes/expert-the-annex-directory:latest
+    front_door: false
+  - name: fileserver
+    image: ctf-boxes/expert-the-annex-fileserver:latest
+    front_door: false
