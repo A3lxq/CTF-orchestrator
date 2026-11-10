@@ -9,3 +9,9 @@ hosts:
   - name: backoffice
     image: ctf-boxes/master-two-offices-backoffice:latest
     front_door: false
+    # Unused by DockerBackend for internal-only hosts (intra-bridge
+    # traffic needs no explicit publish), but required by
+    # KubernetesBackend -- a Service routes only the ports it's told
+    # about, unlike a Docker bridge network.
+    ports:
+      - {container_port: 6000}

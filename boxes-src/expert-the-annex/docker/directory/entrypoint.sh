@@ -23,5 +23,13 @@ slapadd -F /etc/ldap/slapd.d -b "dc=halcyon,dc=local" -l /tmp/seed.ldif
 chown -R openldap:openldap /var/lib/ldap
 rm -f /tmp/seed.ldif
 
+# slapd segfaults on startup under containerd (confirmed under the
+# Kubernetes backend specifically, not plain `docker run`): containerd's
+# default RLIMIT_NOFILE is ~2^31 vs Docker Engine's 1024, and slapd's
+# startup apparently can't handle an rlimit that large -- cap it back to
+# a sane value before exec'ing supervisord (inherited by every child it
+# spawns, including slapd).
+ulimit -n 1024
+
 echo "[entrypoint] Directory ready."
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/ctf.conf

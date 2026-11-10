@@ -11,10 +11,22 @@ from ..schemas import CreateInstanceRequest, InstanceResponse, RenewInstanceRequ
 
 router = APIRouter(prefix="/instances", tags=["instances"])
 
-_backends: dict[str, RuntimeBackend] = {"docker": DockerBackend()}
+_backends: dict[str, RuntimeBackend] = {}
+_BACKEND_FACTORIES = {"docker": DockerBackend}
+# KubernetesBackend isn't imported eagerly: constructing it loads a
+# kubeconfig/in-cluster config immediately, which would make every
+# Docker-only deployment of this orchestrator fail at import time if no
+# cluster is reachable. Imported lazily, only the first time "kubernetes"
+# is actually requested.
 
 
-def get_backend(name: str = "docker") -> RuntimeBackend:
+def get_backend(name: str | None = None) -> RuntimeBackend:
+    name = name or config.DEFAULT_BACKEND
+    if name not in _backends:
+        if name == "kubernetes" and name not in _BACKEND_FACTORIES:
+            from ..backends.k8s_backend import KubernetesBackend
+            _BACKEND_FACTORIES["kubernetes"] = KubernetesBackend
+        _backends[name] = _BACKEND_FACTORIES[name]()
     return _backends[name]
 
 
@@ -67,7 +79,7 @@ async def create_instance(req: CreateInstanceRequest):
         instance = Instance(
             team_id=req.team_id,
             box_id=req.box_id,
-            backend="docker",
+            backend=req.backend or config.DEFAULT_BACKEND,
             network_name="",  # filled in after provisioning
             status=InstanceStatus.PENDING,
             expires_at=utcnow() + timedelta(minutes=ttl),

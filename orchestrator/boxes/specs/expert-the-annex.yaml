@@ -8,6 +8,12 @@ hosts:
   - name: directory
     image: ctf-boxes/expert-the-annex-directory:latest
     front_door: false
+    # Unused by DockerBackend for internal-only hosts, required by
+    # KubernetesBackend (see master-two-offices.yaml's backoffice entry).
+    ports:
+      - {container_port: 389}
   - name: fileserver
     image: ctf-boxes/expert-the-annex-fileserver:latest
     front_door: false
+    ports:
+      - {container_port: 22}

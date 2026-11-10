@@ -8,6 +8,7 @@ class CreateInstanceRequest(BaseModel):
     box_id: str
     team_secret: str
     ttl_minutes: int | None = None
+    backend: str | None = None  # None = use config.DEFAULT_BACKEND
 
 
 class RenewInstanceRequest(BaseModel):

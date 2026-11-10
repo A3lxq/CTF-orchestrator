@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 docker
+kubernetes
 pydantic
 pyyaml
 pytest
