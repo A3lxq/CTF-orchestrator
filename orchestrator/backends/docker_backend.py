@@ -231,21 +231,41 @@ class DockerBackend(RuntimeBackend):
         except NotFound:
             pass
 
+        primary_network = pub_network if host_spec.front_door else (int_network or pub_network)
+
         container = self._client.containers.create(
             image=host_spec.image,
             name=container_name,
             environment=env,
             ports=ports if host_spec.front_door else None,
-            network=pub_network.name if host_spec.front_door else (int_network.name if int_network else pub_network.name),
+            network=primary_network.name,
             detach=True,
         )
+        # Several multi-host boxes' own intended solve path has the
+        # player, after pivoting in via the front door, type the box's
+        # ORIGINAL docker-compose service name as a literal hostname from
+        # an internal shell (e.g. `curl http://backoffice:6000/`,
+        # `ssh ops@fileserver`, `ssh traveler@vault`) -- this is baked
+        # into each box's own writeup, not something settable via an env
+        # var, so every network membership needs a DNS alias equal to
+        # host_spec.name (which is set to match the original compose
+        # service name in every box spec), not just the orchestrator's
+        # own ctf-<box_id>-<team_id>-<service> container name. The
+        # high-level create() API has no alias parameter, so connect
+        # once without one, then disconnect/reconnect with the alias --
+        # safe to do before start(): Docker's published-port NAT setup
+        # reads the container's network config at `start()` time, not at
+        # `create()` time, confirmed by direct test.
+        primary_network.disconnect(container)
+        primary_network.connect(container, aliases=[host_spec.name])
+
         # Multi-host boxes: connect every host to the internal network too
         # (front-door hosts need BOTH the published network and the
         # internal one, since they're the pivot point into internal-only
         # services -- mirrors the original compose files' frontdesk/gateway
         # services being members of both public-net and internal-net).
         if int_network and host_spec.front_door:
-            int_network.connect(container)
+            int_network.connect(container, aliases=[host_spec.name])
         # Internal-only hosts were created with network=int_network.name
         # above and never joined to pub_network at all -- "no published
         # ports, no route except via the front door" is simply never
