@@ -60,7 +60,16 @@ async def create_instance(req: CreateInstanceRequest):
             .filter(
                 Instance.team_id == req.team_id,
                 Instance.box_id == req.box_id,
-                Instance.status != InstanceStatus.DESTROYED,
+                # Only reattach to a genuinely RUNNING instance -- `!=
+                # DESTROYED` also matched ERROR (and PENDING) rows,
+                # meaning a single transient provisioning failure got
+                # cached forever: every later request for that same
+                # (team_id, box_id) silently got handed back the same
+                # broken row (status=ERROR, entry_host/entry_port still
+                # null from before the exception) instead of ever
+                # retrying. Confirmed via direct DB inspection after a
+                # real run hit exactly this.
+                Instance.status == InstanceStatus.RUNNING,
             )
             .one_or_none()
         )
@@ -126,7 +135,7 @@ async def get_instance_by_key(team_id: int, box_id: str):
             .filter(
                 Instance.team_id == team_id,
                 Instance.box_id == box_id,
-                Instance.status != InstanceStatus.DESTROYED,
+                Instance.status == InstanceStatus.RUNNING,
             )
             .one_or_none()
         )

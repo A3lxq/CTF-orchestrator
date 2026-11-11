@@ -97,8 +97,19 @@ def two_teams(request):
     try:
         yield box_id, inst1, inst2, secret1, secret2
     finally:
-        requests.delete(f"{BASE_URL}/instances/{inst1['instance_id']}")
-        requests.delete(f"{BASE_URL}/instances/{inst2['instance_id']}")
+        # Loud on purpose: a silently-swallowed destroy failure here used
+        # to leave a stale non-RUNNING row that (before the idempotent-
+        # create fix in api/instances.py) got silently reattached to by
+        # every later test for the same box_id, turning one transient
+        # failure into a permanent one with no visible cause. Surface it
+        # immediately at the test that caused it instead.
+        errors = []
+        for inst in (inst1, inst2):
+            resp = requests.delete(f"{BASE_URL}/instances/{inst['instance_id']}")
+            if not resp.ok:
+                errors.append(f"{inst['instance_id']}: {resp.status_code} {resp.text}")
+        if errors:
+            raise AssertionError(f"{box_id}: teardown failed to destroy instance(s): {errors}")
 
 
 def _namespace(box_id: str, team_id: int) -> str:

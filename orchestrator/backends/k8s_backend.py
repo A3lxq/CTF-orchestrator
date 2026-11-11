@@ -344,7 +344,7 @@ class KubernetesBackend(RuntimeBackend):
         )
         self._net.create_namespaced_network_policy(namespace, allow_external)
 
-    def _wait_for_deployment_ready(self, namespace: str, name: str, timeout_seconds: float = 60.0) -> None:
+    def _wait_for_deployment_ready(self, namespace: str, name: str, timeout_seconds: float = 120.0) -> None:
         deadline = time.monotonic() + timeout_seconds
         last_status = None
         while time.monotonic() < deadline:
@@ -355,7 +355,7 @@ class KubernetesBackend(RuntimeBackend):
             time.sleep(1)
         raise RuntimeError(f"deployment {namespace}/{name} never became ready within {timeout_seconds}s ({last_status})")
 
-    def _wait_for_service(self, host: str, port: int, timeout_seconds: float = 30.0) -> None:
+    def _wait_for_service(self, host: str, port: int, timeout_seconds: float = 90.0) -> None:
         """Same protocol-agnostic probe as DockerBackend's
         _wait_for_service (see its own docstring for the full
         rationale) -- reused here verbatim since NodePort's readiness
@@ -430,7 +430,7 @@ class KubernetesBackend(RuntimeBackend):
     async def destroy(self, instance: Instance) -> None:
         await asyncio.to_thread(self._destroy_sync, instance)
 
-    def _destroy_sync(self, instance: Instance, timeout_seconds: float = 60.0) -> None:
+    def _destroy_sync(self, instance: Instance, timeout_seconds: float = 180.0) -> None:
         # Namespace-per-instance means destroy is just deleting the
         # namespace -- k8s garbage-collects every Deployment/Pod/Service/
         # NetworkPolicy inside it automatically, mirroring how the Docker
