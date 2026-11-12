@@ -63,6 +63,14 @@ BOX_CONFIG = {
     "god-the-ferryman": {
         "front_door": {"service": "portal", "port": 5000, "path": "/"},
         "internal": [("waystation", 7000), ("vault", 22)],
+        # Portal's own internal_groups (segment-a) doesn't include Vault's
+        # (segment-b) -- see god-the-ferryman.yaml and registry.py's
+        # HostSpec.internal_groups -- so, unlike every other box here,
+        # Portal can reach Waystation directly but NOT Vault. Exercised by
+        # test_god_chain_topology below, not by
+        # test_front_door_reaches_internal_hosts_by_name (which this key
+        # narrows accordingly).
+        "front_door_reachable": [("waystation", 7000)],
     },
 }
 
@@ -148,7 +156,7 @@ def test_front_door_reaches_internal_hosts_by_name(two_teams):
     box_id, inst1, _, _, _ = two_teams
     ns1 = _namespace(box_id, 801)
     fd_service = BOX_CONFIG[box_id]["front_door"]["service"]
-    for service, port in BOX_CONFIG[box_id]["internal"]:
+    for service, port in BOX_CONFIG[box_id].get("front_door_reachable", BOX_CONFIG[box_id]["internal"]):
         reach = _kubectl(
             "exec", "-n", ns1, f"deploy/{fd_service}", "--",
             "timeout", "3", "bash", "-c", f"echo > /dev/tcp/{service}/{port}",
@@ -178,6 +186,54 @@ def test_cross_team_isolation(two_teams):
         "timeout", "3", "bash", "-c", f"echo > /dev/tcp/127.0.0.1/{fd_port}",
     )
     assert own.returncode == 0, f"{box_id}: sanity check failed -- team 1 couldn't even reach its own pod"
+
+
+@pytest.fixture
+def god_instance():
+    """Single-team instance of god-the-ferryman specifically, for the chain-
+    topology check below -- a fresh team_id (803) rather than reusing
+    two_teams' 801/802 so this never races/collides with that fixture's own
+    teardown for the same box."""
+    box_id = "god-the-ferryman"
+    secret = pysecrets.token_hex(32)
+    r = requests.post(f"{BASE_URL}/instances", json={
+        "team_id": 803, "box_id": box_id, "team_secret": secret, "backend": "kubernetes",
+    })
+    r.raise_for_status()
+    inst = r.json()
+    try:
+        yield inst
+    finally:
+        requests.delete(f"{BASE_URL}/instances/{inst['instance_id']}").raise_for_status()
+
+
+def test_god_chain_topology(god_instance):
+    """Kubernetes-side mirror of the Docker chain-topology check: god-the-
+    ferryman's NetworkPolicies (see k8s_backend.py's _apply_network_policies,
+    built from the same internal_groups as the Docker backend's networks)
+    must enforce the same Portal -> Waystation -> Vault chain, not a flat
+    any-pod-to-any-pod namespace -- Portal must NOT reach Vault directly,
+    only Waystation (the pivot) can."""
+    box_id = "god-the-ferryman"
+    ns = _namespace(box_id, 803)
+
+    blocked = _kubectl(
+        "exec", "-n", ns, "deploy/portal", "--",
+        "timeout", "3", "bash", "-c", "echo > /dev/tcp/vault/22",
+    )
+    assert blocked.returncode != 0, "portal must not reach vault directly -- chain topology requires routing via waystation"
+
+    pivot = _kubectl(
+        "exec", "-n", ns, "deploy/waystation", "--",
+        "timeout", "3", "bash", "-c", "echo > /dev/tcp/vault/22",
+    )
+    assert pivot.returncode == 0, "waystation (the pivot) must be able to reach vault directly"
+
+    hop = _kubectl(
+        "exec", "-n", ns, "deploy/portal", "--",
+        "timeout", "3", "bash", "-c", "echo > /dev/tcp/waystation/7000",
+    )
+    assert hop.returncode == 0, "portal must still reach waystation directly (the one legal hop in the chain)"
 
 
 def test_idempotent_create(two_teams):

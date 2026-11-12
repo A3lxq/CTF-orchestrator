@@ -342,25 +342,38 @@ class KubernetesBackend(RuntimeBackend):
 
     def _apply_network_policies(self, namespace: str, spec: BoxSpec) -> None:
         front_door = spec.front_door_host
-        # Once ANY NetworkPolicy selects a pod for Ingress, that pod's
-        # ingress becomes default-deny except what's explicitly allowed
-        # across all matching policies -- so "allow-intra-namespace"
-        # below (podSelector={} selects every pod) already makes every
-        # pod in this namespace default-deny-from-outside with no
+        # k8s has no separate network-topology layer the way Docker has
+        # separate bridge networks -- every pod in a namespace already
+        # shares one flat pod network, so segmentation (HostSpec's
+        # internal_groups) has to be enforced here, at the NetworkPolicy
+        # layer, instead. One per-host policy selecting only that host's
+        # own pod, allowing Ingress only from the OTHER hosts it shares at
+        # least one internal_groups entry with -- for the common case
+        # where every host defaults to the same single group "internal",
+        # that's every other host, so this reproduces the old blanket
+        # "allow-intra-namespace" policy's ANY-pod-to-ANY-pod behavior
+        # exactly. Once ANY NetworkPolicy selects a pod for Ingress, that
+        # pod's ingress becomes default-deny except what's explicitly
+        # allowed across all matching policies -- each host being
+        # selected by its own policy here (an empty ingress list for a
+        # host with no groupmates) already makes every pod in this
+        # namespace default-deny-from-outside, same as before, with no
         # separate explicit deny-all policy needed.
-        allow_intra = k8s_client.V1NetworkPolicy(
-            metadata=k8s_client.V1ObjectMeta(name="allow-intra-namespace", namespace=namespace),
-            spec=k8s_client.V1NetworkPolicySpec(
-                pod_selector=k8s_client.V1LabelSelector(),
-                policy_types=["Ingress"],
-                ingress=[
-                    k8s_client.V1NetworkPolicyIngressRule(
-                        _from=[k8s_client.V1NetworkPolicyPeer(pod_selector=k8s_client.V1LabelSelector())]
-                    )
-                ],
-            ),
-        )
-        self._net.create_namespaced_network_policy(namespace, allow_intra)
+        for host in spec.hosts:
+            peers = [
+                k8s_client.V1NetworkPolicyPeer(pod_selector=k8s_client.V1LabelSelector(match_labels={"app": other.name}))
+                for other in spec.hosts
+                if other.name != host.name and set(other.internal_groups) & set(host.internal_groups)
+            ]
+            group_policy = k8s_client.V1NetworkPolicy(
+                metadata=k8s_client.V1ObjectMeta(name=f"allow-group-{host.name}", namespace=namespace),
+                spec=k8s_client.V1NetworkPolicySpec(
+                    pod_selector=k8s_client.V1LabelSelector(match_labels={"app": host.name}),
+                    policy_types=["Ingress"],
+                    ingress=[k8s_client.V1NetworkPolicyIngressRule(_from=peers)] if peers else [],
+                ),
+            )
+            self._net.create_namespaced_network_policy(namespace, group_policy)
 
         # Omitting `from` entirely would mean "allow from literally any
         # source" -- which, combined with every host being the front door

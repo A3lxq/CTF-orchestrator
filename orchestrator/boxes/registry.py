@@ -34,6 +34,17 @@ class HostSpec:
     ports: list[PortSpec] = field(default_factory=list)
     pasv_range: PasvRangeSpec | None = None
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Which internal-network segment(s) this host joins, by name. Every box
+    # defaults to the single shared group "internal" -- one segment, every
+    # host (front door included) a member -- reproducing today's flat
+    # topology exactly for boxes that don't set this. A host listing MORE
+    # than one group (e.g. a pivot host in a chain) joins all of them, so
+    # it can bridge traffic between segments that otherwise can't reach
+    # each other; see god-the-ferryman.yaml for the motivating case (a
+    # deliberate Portal -> Waystation -> Vault chain, no direct
+    # Portal<->Vault reachability, mirroring that box's original VM-build
+    # topology).
+    internal_groups: list[str] = field(default_factory=lambda: ["internal"])
 
 
 @dataclass
@@ -64,6 +75,7 @@ def _parse_host(raw: dict) -> HostSpec:
         ports=ports,
         pasv_range=pasv,
         extra_env=raw.get("extra_env", {}),
+        internal_groups=list(raw.get("internal_groups") or ["internal"]),
     )
 
 

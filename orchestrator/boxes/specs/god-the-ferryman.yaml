@@ -1,10 +1,20 @@
 box_id: god-the-ferryman
+# Chain topology, not a star: Portal -> Waystation -> Vault, with no direct
+# Portal<->Vault reachability. This mirrors this box's original VM/OVA
+# appliance build's own deliberate design (its build notes: wiring Portal
+# directly to Vault breaks the box) -- the flat single-internal-network
+# topology every other multi-host box here uses would let Portal reach
+# Vault's open SSH port directly, which is a real segmentation gap even
+# though it isn't currently puzzle-breaking (Vault's credentials are still
+# only disclosed via Waystation's own RCE). internal_groups makes Waystation
+# the only host that's a member of both segments, i.e. the only pivot.
 hosts:
   - name: portal
     image: ctf-boxes/god-the-ferryman-portal:latest
     front_door: true
     ports:
       - {container_port: 5000}
+    internal_groups: [segment-a]
   - name: waystation
     image: ctf-boxes/god-the-ferryman-waystation:latest
     front_door: false
@@ -12,8 +22,12 @@ hosts:
     # KubernetesBackend (see master-two-offices.yaml's backoffice entry).
     ports:
       - {container_port: 7000}
+    # The pivot: shares segment-a with Portal and segment-b with Vault, so
+    # it's the only host that can reach -- and be reached by -- both.
+    internal_groups: [segment-a, segment-b]
   - name: vault
     image: ctf-boxes/god-the-ferryman-vault:latest
     front_door: false
     ports:
       - {container_port: 22}
+    internal_groups: [segment-b]

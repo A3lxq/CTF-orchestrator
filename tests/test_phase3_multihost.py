@@ -38,6 +38,16 @@ BASE_URL = os.environ.get("ORCHESTRATOR_TEST_URL", "http://127.0.0.1:9100")
 # (service_name, port) pairs -- service_name doubles as both the box's
 # original compose hostname (the alias under test) and the orchestrator's
 # own ctf-<box_id>-<team_id>-<service> container name suffix.
+#
+# "internal" lists every internal-only host (used by the not-published and
+# cross-team-isolation checks, which apply regardless of internal topology).
+# "front_door_reachable" (defaults to the same list when omitted) lists only
+# the internal hosts the front door can reach DIRECTLY -- for god-the-ferryman
+# that's a strict subset: Portal's own internal_groups spec entry only puts
+# it on Waystation's segment, not Vault's (see god-the-ferryman.yaml and
+# registry.py's HostSpec.internal_groups) -- the box's own chain topology
+# (Portal -> Waystation -> Vault, no direct Portal<->Vault) is exercised by
+# the dedicated test_god_chain_topology tests below instead.
 BOX_CONFIG = {
     "master-two-offices": {
         "front_door": {"service": "frontdesk", "port": 5000, "path": "/"},
@@ -50,6 +60,7 @@ BOX_CONFIG = {
     "god-the-ferryman": {
         "front_door": {"service": "portal", "port": 5000, "path": "/"},
         "internal": [("waystation", 7000), ("vault", 22)],
+        "front_door_reachable": [("waystation", 7000)],
     },
 }
 
@@ -139,7 +150,7 @@ def test_front_door_reaches_internal_hosts_by_alias(two_teams):
     container name, from a shell on the front door."""
     box_id, inst1, _, _, _ = two_teams
     fd1 = _front_door_container(box_id, 201)
-    for service, port in BOX_CONFIG[box_id]["internal"]:
+    for service, port in BOX_CONFIG[box_id].get("front_door_reachable", BOX_CONFIG[box_id]["internal"]):
         resolved = _exec(fd1, "getent", "hosts", service)
         assert resolved.returncode == 0, f"{box_id}: front door could not resolve internal hostname {service!r}: {resolved.stderr}"
 
@@ -162,6 +173,63 @@ def test_cross_team_internal_isolation(two_teams):
         team2_ip = ip_out.stdout.split()[0]
         reach = _exec(fd1, "timeout", "3", "bash", "-c", f"echo > /dev/tcp/{team2_ip}/{port}")
         assert reach.returncode != 0, f"{box_id}: team 1's front door must not reach team 2's {service} directly"
+
+
+@pytest.fixture
+def god_instance():
+    """Single-team instance of god-the-ferryman specifically, for the chain-
+    topology checks below -- a fresh team_id (203) rather than reusing
+    two_teams' 201/202 so this never races/collides with that fixture's own
+    teardown for the same box."""
+    box_id = "god-the-ferryman"
+    secret = pysecrets.token_hex(32)
+    r = requests.post(f"{BASE_URL}/instances", json={"team_id": 203, "box_id": box_id, "team_secret": secret})
+    r.raise_for_status()
+    inst = r.json()
+    try:
+        yield inst
+    finally:
+        requests.delete(f"{BASE_URL}/instances/{inst['instance_id']}")
+
+
+def test_god_chain_topology(god_instance):
+    """god-the-ferryman's intended solve path chains Portal -> Waystation ->
+    Vault (per that box's original VM-build design notes: wiring Portal
+    directly to Vault breaks the box). Portal must NOT be able to reach
+    Vault directly at the network layer -- only Waystation, the declared
+    pivot (god-the-ferryman.yaml's segment-a/segment-b internal_groups),
+    can. test_front_door_reaches_internal_hosts_by_alias above already
+    confirms Portal can still reach Waystation, the one legal hop."""
+    box_id = "god-the-ferryman"
+    portal = _front_door_container(box_id, 203)
+    waystation = _internal_container(box_id, 203, "waystation")
+    vault = _internal_container(box_id, 203, "vault")
+
+    # Portal cannot resolve or reach Vault by alias -- no shared segment.
+    resolved = _exec(portal, "getent", "hosts", "vault")
+    assert resolved.returncode != 0, "portal must not resolve vault's alias (no shared internal segment)"
+    reach = _exec(portal, "timeout", "3", "bash", "-c", "echo > /dev/tcp/vault/22")
+    assert reach.returncode != 0, "portal must not reach vault directly -- chain topology requires routing via waystation"
+
+    # Belt-and-suspenders: rule out "alias just didn't resolve" masking an
+    # actually-reachable network by also trying Vault's bare IP.
+    vault_ip_out = subprocess.run(
+        ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", vault],
+        capture_output=True, text=True, check=True,
+    )
+    for vault_ip in vault_ip_out.stdout.split():
+        reach_ip = _exec(portal, "timeout", "3", "bash", "-c", f"echo > /dev/tcp/{vault_ip}/22")
+        assert reach_ip.returncode != 0, f"portal must not reach vault at {vault_ip} either"
+
+    # Waystation -- the declared pivot -- CAN reach Vault directly.
+    pivot_reach = _exec(waystation, "timeout", "3", "bash", "-c", "echo > /dev/tcp/vault/22")
+    assert pivot_reach.returncode == 0, "waystation (the pivot) must be able to reach vault directly"
+
+    # And the chain's one legal hop (Portal -> Waystation) still works, so
+    # Vault remains reachable from the front door's side -- just via
+    # Waystation, never directly.
+    hop = _exec(portal, "timeout", "3", "bash", "-c", "echo > /dev/tcp/waystation/7000")
+    assert hop.returncode == 0, "portal must still reach waystation directly (the one legal hop in the chain)"
 
 
 def test_idempotent_create(two_teams):

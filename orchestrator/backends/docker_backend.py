@@ -76,10 +76,22 @@ class DockerBackend(RuntimeBackend):
 
     def _provision_sync(self, instance: Instance, spec: BoxSpec, team_secret: str) -> ProvisionResult:
         network_name = f"ctf-{spec.box_id}-{instance.team_id}"
-        internal_network_name = f"{network_name}-internal"
 
         pub_network = self._get_or_create_network(network_name)
-        int_network = self._get_or_create_network(internal_network_name, internal=True) if spec.is_multi_host else None
+        # One bridge network per distinct internal_groups name referenced
+        # across the spec's hosts, instead of always exactly one -- a host
+        # joins every group it lists (see HostSpec.internal_groups). Boxes
+        # that never set internal_groups all default to the single group
+        # "internal", which _internal_network_name maps back onto today's
+        # exact "...-internal" name, so this is a fully backward-compatible
+        # no-op for every box that doesn't opt into named segments.
+        internal_networks: dict[str, object] = {}
+        if spec.is_multi_host:
+            group_names = sorted({g for h in spec.hosts for g in h.internal_groups})
+            for group in group_names:
+                internal_networks[group] = self._get_or_create_network(
+                    self._internal_network_name(network_name, group), internal=True
+                )
 
         used_ports = self._used_host_ports()
         provisioned: list[ProvisionedHost] = []
@@ -87,6 +99,8 @@ class DockerBackend(RuntimeBackend):
         front_door_all_host_ports: list[int] = []
         front_door_container = None
         internal_wait_targets: list[tuple[str, int]] = []
+        host_containers: dict[str, object] = {}
+        host_groups: dict[str, set[str]] = {h.name: set(h.internal_groups) for h in spec.hosts}
 
         for host_spec in spec.hosts:
             container = self._start_host(
@@ -94,22 +108,26 @@ class DockerBackend(RuntimeBackend):
                 host_spec=host_spec,
                 team_secret=team_secret,
                 pub_network=pub_network,
-                int_network=int_network,
+                internal_networks=internal_networks,
                 used_ports=used_ports,
             )
+            host_containers[host_spec.name] = container
             container.reload()
             internal_ip = None
             net_settings = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-            # Multi-host boxes give the front-door host membership in BOTH
-            # networks (see _start_host's comment) -- report the INTERNAL
-            # network's IP here, since that's the address siblings (and
-            # any future consumer of this field) would actually use to
-            # reach it, not the public-facing one. Single-host boxes have
-            # no internal network at all (int_network is None), so there
-            # the public network's IP is the only one there is.
-            if int_network is not None and internal_network_name in net_settings:
-                internal_ip = net_settings[internal_network_name].get("IPAddress")
-            elif network_name in net_settings:
+            # Prefer an internal network's IP when this host is a member of
+            # one (multi-host boxes; front-door hosts join both the public
+            # network and every internal group they list) -- that's the
+            # address siblings (and any future consumer of this field)
+            # actually use to reach it, not the public-facing one.
+            # Single-host boxes have no internal network at all, so the
+            # public network's IP is the only one there is.
+            for group in host_spec.internal_groups:
+                group_net_name = self._internal_network_name(network_name, group)
+                if group_net_name in net_settings:
+                    internal_ip = net_settings[group_net_name].get("IPAddress")
+                    break
+            if internal_ip is None and network_name in net_settings:
                 internal_ip = net_settings[network_name].get("IPAddress")
 
             provisioned.append(
@@ -143,7 +161,7 @@ class DockerBackend(RuntimeBackend):
                 # Internal-only host: no published port to probe from the
                 # orchestrator host side, so remember it (name == its
                 # network alias, per _start_host) to be probed below via
-                # the front door, once every container has been started.
+                # a relay container, once every container has been started.
                 for p in host_spec.ports:
                     internal_wait_targets.append((host_spec.name, p.container_port))
 
@@ -176,10 +194,30 @@ class DockerBackend(RuntimeBackend):
         # Expert's directory host). Mirrors the Kubernetes backend's
         # _provision_sync, which waits on every HostSpec via
         # _wait_for_deployment_ready, not just the front door's.
+        #
+        # Probe each via `docker exec` from a RELAY container that's
+        # actually on a shared internal network with it. For most boxes
+        # that's always the front door, since every host defaults to the
+        # same single "internal" group -- but a segmented box can isolate
+        # a host from the front door entirely (e.g. god-the-ferryman's
+        # vault, in segment-b while the front door/portal is only in
+        # segment-a): there, relay via whichever OTHER already-started
+        # host shares a group with the target instead (waystation, the
+        # pivot, for vault).
         if internal_wait_targets:
-            assert front_door_container is not None, "internal-only hosts require a front-door host in the spec"
+            front_door_name = next(h.name for h in spec.hosts if h.front_door)
             for host, port in internal_wait_targets:
-                self._wait_for_internal_service(front_door_container, host, port)
+                target_groups = host_groups[host]
+                relay = None
+                if host_groups[front_door_name] & target_groups:
+                    relay = front_door_container
+                else:
+                    for other_name, other_container in host_containers.items():
+                        if other_name != host and host_groups[other_name] & target_groups:
+                            relay = other_container
+                            break
+                assert relay is not None, f"no started container shares an internal network with {host}"
+                self._wait_for_internal_service(relay, host, port)
 
         return ProvisionResult(
             network_name=network_name,
@@ -202,23 +240,25 @@ class DockerBackend(RuntimeBackend):
         )
 
     def _wait_for_internal_service(
-        self, front_door_container, host: str, port: int, timeout_seconds: float = 30.0
+        self, relay_container, host: str, port: int, timeout_seconds: float = 30.0
     ) -> None:
         """Readiness probe for an internal-only host, which has no
         published port reachable from the orchestrator host at all --
-        instead this runs the probe via `docker exec` inside the
-        front-door container, which is already a confirmed member of
-        the internal network (see _start_host) and can resolve `host`
-        by its network alias. Uses the same retry loop (_retry_probe)
-        as _wait_for_service, but NOT the same per-attempt banner-or-GET
+        instead this runs the probe via `docker exec` inside
+        relay_container, a container already confirmed to be a member of
+        a network `host` is also on (see _provision_sync's relay
+        selection -- usually the front door, but not always once a box
+        segments its internal networks), which can resolve `host` by its
+        network alias. Uses the same retry loop (_retry_probe) as
+        _wait_for_service, but NOT the same per-attempt banner-or-GET
         probe -- see _exec_probe_attempt's own comment for why a plain
         connect() is the right (and, for a protocol like raw LDAP, the
         only correct) signal here, unlike for a published front-door
         port."""
         self._retry_probe(
-            lambda: self._exec_probe_attempt(front_door_container, host, port),
+            lambda: self._exec_probe_attempt(relay_container, host, port),
             timeout_seconds,
-            f"internal host {host}:{port} (probed via front-door container exec)",
+            f"internal host {host}:{port} (probed via container exec)",
         )
 
     def _retry_probe(self, probe_once, timeout_seconds: float, description: str) -> None:
@@ -227,8 +267,8 @@ class DockerBackend(RuntimeBackend):
         succeeds or timeout_seconds elapses. Used by both
         _wait_for_service (direct host-side TCP probe) and
         _wait_for_internal_service (docker-exec-based probe from inside
-        the front door) -- only the single-attempt probe differs between
-        the two; the wait/retry policy is identical."""
+        a relay container) -- only the single-attempt probe differs
+        between the two; the wait/retry policy is identical."""
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
             if probe_once():
@@ -293,8 +333,8 @@ exec 3<>"/dev/tcp/${host}/${port}" 2>/dev/null && exit 0
 exit 1
 """
 
-    def _exec_probe_attempt(self, front_door_container, host: str, port: int) -> bool:
-        exit_code, _output = front_door_container.exec_run(
+    def _exec_probe_attempt(self, relay_container, host: str, port: int) -> bool:
+        exit_code, _output = relay_container.exec_run(
             ["timeout", "5", "bash", "-c", self._EXEC_PROBE_SCRIPT, "probe", host, str(port)],
             demux=False,
         )
@@ -306,7 +346,18 @@ exit 1
         except NotFound:
             return self._client.networks.create(name, driver="bridge", internal=internal)
 
-    def _start_host(self, instance, host_spec: HostSpec, team_secret: str, pub_network, int_network, used_ports: set[int]):
+    def _internal_network_name(self, network_name: str, group: str) -> str:
+        # The implicit default group every box gets when it doesn't set
+        # internal_groups keeps today's exact "<network_name>-internal"
+        # name -- any other (named-segment) group gets a distinguishing
+        # "-internal-<group>" suffix instead, so _destroy_sync's prefix
+        # match ("<network_name>-internal*") still catches every internal
+        # network this instance ever created, old-style or segmented.
+        if group == "internal":
+            return f"{network_name}-internal"
+        return f"{network_name}-internal-{group}"
+
+    def _start_host(self, instance, host_spec: HostSpec, team_secret: str, pub_network, internal_networks: dict, used_ports: set[int]):
         env = {"CTF_SECRET": team_secret, **host_spec.extra_env}
         ports: dict[str, int] = {}
 
@@ -340,7 +391,13 @@ exit 1
         except NotFound:
             pass
 
-        primary_network = pub_network if host_spec.front_door else (int_network or pub_network)
+        # Primary network at create()-time: pub_network for the front door
+        # (so its published ports bind there), else its first listed
+        # internal group -- falling back to pub_network only if this box
+        # has no internal networks at all (single-host boxes).
+        primary_network = pub_network
+        if not host_spec.front_door and internal_networks:
+            primary_network = internal_networks.get(host_spec.internal_groups[0], pub_network)
 
         container = self._client.containers.create(
             image=host_spec.image,
@@ -368,18 +425,25 @@ exit 1
         primary_network.disconnect(container)
         primary_network.connect(container, aliases=[host_spec.name])
 
-        # Multi-host boxes: connect every host to the internal network too
-        # (front-door hosts need BOTH the published network and the
-        # internal one, since they're the pivot point into internal-only
-        # services -- mirrors the original compose files' frontdesk/gateway
-        # services being members of both public-net and internal-net).
-        if int_network and host_spec.front_door:
-            int_network.connect(container, aliases=[host_spec.name])
-        # Internal-only hosts were created with network=int_network.name
-        # above and never joined to pub_network at all -- "no published
-        # ports, no route except via the front door" is simply never
-        # giving them a second network, matching the original compose
-        # design's internal-only services exactly.
+        # Join every OTHER internal group this host lists beyond its
+        # primary one. For a front-door host that's every internal group
+        # it has (mirrors the original compose files' frontdesk/gateway
+        # services being members of both public-net and internal-net). For
+        # an internal-only host with more than one group -- a pivot like
+        # god-the-ferryman's waystation, joining both "segment-a" and
+        # "segment-b" -- that's every group after the first (its primary).
+        # A host that only ever lists one group (every box that doesn't
+        # opt into named segments) has nothing left here, same as today.
+        extra_groups = host_spec.internal_groups if host_spec.front_door else host_spec.internal_groups[1:]
+        for group in extra_groups:
+            net = internal_networks.get(group)
+            if net:
+                net.connect(container, aliases=[host_spec.name])
+        # Internal-only hosts were created with network=<their primary
+        # internal network>.name above and never joined to pub_network at
+        # all -- "no published ports, no route except via the front door"
+        # is simply never giving them a connection to pub_network, matching
+        # the original compose design's internal-only services exactly.
 
         container.start()
         return container
@@ -408,11 +472,25 @@ exit 1
                 c.remove(force=True)
             except NotFound:
                 pass
-        for net_name in (instance.network_name, f"{instance.network_name}-internal"):
-            try:
-                net = self._client.networks.get(net_name)
-                net.remove()
-            except NotFound:
-                pass
-            except docker.errors.APIError:
-                pass
+        try:
+            net = self._client.networks.get(instance.network_name)
+            net.remove()
+        except NotFound:
+            pass
+        except docker.errors.APIError:
+            pass
+        # Segmented boxes (see HostSpec.internal_groups) can create more
+        # than one internal network per instance, named
+        # "<network_name>-internal" or "<network_name>-internal-<group>" --
+        # rather than re-deriving the exact set of group names from the
+        # box's (possibly since-changed) spec, just sweep every network
+        # that matches this instance's own internal-network prefix. Catches
+        # every internal network this instance ever created, old-style
+        # (one, unsuffixed) or segmented (several, suffixed) alike.
+        prefix = f"{instance.network_name}-internal"
+        for net in self._client.networks.list():
+            if net.name == prefix or net.name.startswith(f"{prefix}-"):
+                try:
+                    net.remove()
+                except docker.errors.APIError:
+                    pass
