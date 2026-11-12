@@ -85,6 +85,8 @@ class DockerBackend(RuntimeBackend):
         provisioned: list[ProvisionedHost] = []
         front_door_host_port: int | None = None
         front_door_all_host_ports: list[int] = []
+        front_door_container = None
+        internal_wait_targets: list[tuple[str, int]] = []
 
         for host_spec in spec.hosts:
             container = self._start_host(
@@ -98,10 +100,17 @@ class DockerBackend(RuntimeBackend):
             container.reload()
             internal_ip = None
             net_settings = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-            if network_name in net_settings:
-                internal_ip = net_settings[network_name].get("IPAddress")
-            elif internal_network_name in net_settings:
+            # Multi-host boxes give the front-door host membership in BOTH
+            # networks (see _start_host's comment) -- report the INTERNAL
+            # network's IP here, since that's the address siblings (and
+            # any future consumer of this field) would actually use to
+            # reach it, not the public-facing one. Single-host boxes have
+            # no internal network at all (int_network is None), so there
+            # the public network's IP is the only one there is.
+            if int_network is not None and internal_network_name in net_settings:
                 internal_ip = net_settings[internal_network_name].get("IPAddress")
+            elif network_name in net_settings:
+                internal_ip = net_settings[network_name].get("IPAddress")
 
             provisioned.append(
                 ProvisionedHost(
@@ -113,6 +122,7 @@ class DockerBackend(RuntimeBackend):
             )
 
             if host_spec.front_door:
+                front_door_container = container
                 ports = container.attrs.get("NetworkSettings", {}).get("Ports") or {}
                 # Prefer port 80 (HTTP) as "the" single entry port shown to
                 # callers/GZCTF when present -- it's the most meaningful
@@ -129,6 +139,13 @@ class DockerBackend(RuntimeBackend):
                         front_door_all_host_ports.append((port_num, p.container_port))
                         if front_door_host_port is None:
                             front_door_host_port = port_num
+            else:
+                # Internal-only host: no published port to probe from the
+                # orchestrator host side, so remember it (name == its
+                # network alias, per _start_host) to be probed below via
+                # the front door, once every container has been started.
+                for p in host_spec.ports:
+                    internal_wait_targets.append((host_spec.name, p.container_port))
 
         if front_door_host_port is None:
             raise RuntimeError("front-door host did not come up with an expected published port")
@@ -150,6 +167,20 @@ class DockerBackend(RuntimeBackend):
         for port_num, _container_port in front_door_all_host_ports:
             self._wait_for_service(config.DOCKER_HOST_PUBLIC_ADDRESS, port_num)
 
+        # Internal-only hosts (Master's backoffice, Expert's
+        # directory/fileserver, God's waystation/vault, ...) have no
+        # published port at all, so they never went through the wait
+        # above -- without this they'd be reported "running" the instant
+        # their container object exists, with no confirmation the service
+        # inside has actually finished starting (e.g. real slapd on
+        # Expert's directory host). Mirrors the Kubernetes backend's
+        # _provision_sync, which waits on every HostSpec via
+        # _wait_for_deployment_ready, not just the front door's.
+        if internal_wait_targets:
+            assert front_door_container is not None, "internal-only hosts require a front-door host in the spec"
+            for host, port in internal_wait_targets:
+                self._wait_for_internal_service(front_door_container, host, port)
+
         return ProvisionResult(
             network_name=network_name,
             entry_host=config.DOCKER_HOST_PUBLIC_ADDRESS,
@@ -158,38 +189,116 @@ class DockerBackend(RuntimeBackend):
         )
 
     def _wait_for_service(self, host: str, port: int, timeout_seconds: float = 30.0) -> None:
-        """Protocol-agnostic readiness probe. A plain TCP connect() is not
-        enough (see the race described above this method's call site) --
-        this requires an actual response from the listener behind the
-        connection: either a server-first banner (SSH/FTP send one
-        unprompted) or, if nothing arrives unprompted, a reply to a
-        generic HTTP GET. Either a reset while waiting for that response,
-        or getting no response from either probe, means try again."""
-        deadline = time.monotonic() + timeout_seconds
-        last_error: Exception | None = None
-        while time.monotonic() < deadline:
-            try:
-                with socket.create_connection((host, port), timeout=1.0) as s:
-                    s.settimeout(1.0)
-                    try:
-                        data = s.recv(16)
-                        if data:
-                            return
-                        last_error = RuntimeError("connection closed with no data")
-                        time.sleep(0.5)
-                        continue
-                    except TimeoutError:
-                        pass  # no server-first banner -- try an HTTP probe below
+        """Protocol-agnostic readiness probe, for a host-reachable
+        (published) port -- the front door's own ports, probed directly
+        from the orchestrator host. See _retry_probe for the shared
+        retry loop and _tcp_probe_attempt for the shared per-attempt
+        banner-or-GET decision tree this and _wait_for_internal_service
+        both rely on."""
+        self._retry_probe(
+            lambda: self._tcp_probe_attempt(host, port),
+            timeout_seconds,
+            f"port {host}:{port}",
+        )
 
-                    s.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+    def _wait_for_internal_service(
+        self, front_door_container, host: str, port: int, timeout_seconds: float = 30.0
+    ) -> None:
+        """Readiness probe for an internal-only host, which has no
+        published port reachable from the orchestrator host at all --
+        instead this runs the probe via `docker exec` inside the
+        front-door container, which is already a confirmed member of
+        the internal network (see _start_host) and can resolve `host`
+        by its network alias. Uses the same retry loop (_retry_probe)
+        as _wait_for_service, but NOT the same per-attempt banner-or-GET
+        probe -- see _exec_probe_attempt's own comment for why a plain
+        connect() is the right (and, for a protocol like raw LDAP, the
+        only correct) signal here, unlike for a published front-door
+        port."""
+        self._retry_probe(
+            lambda: self._exec_probe_attempt(front_door_container, host, port),
+            timeout_seconds,
+            f"internal host {host}:{port} (probed via front-door container exec)",
+        )
+
+    def _retry_probe(self, probe_once, timeout_seconds: float, description: str) -> None:
+        """Shared retry loop: call probe_once() (a single readiness
+        attempt, True meaning "got a real response") repeatedly until it
+        succeeds or timeout_seconds elapses. Used by both
+        _wait_for_service (direct host-side TCP probe) and
+        _wait_for_internal_service (docker-exec-based probe from inside
+        the front door) -- only the single-attempt probe differs between
+        the two; the wait/retry policy is identical."""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if probe_once():
+                return
+            time.sleep(0.5)
+        raise RuntimeError(f"{description} never produced a real response within {timeout_seconds}s")
+
+    def _tcp_probe_attempt(self, host: str, port: int) -> bool:
+        """Single readiness-probe attempt via a direct host-side TCP
+        connection. A plain TCP connect() is not enough (see
+        _wait_for_service's call site in _provision_sync for the race
+        this guards against): this requires an actual response from the
+        listener behind the connection -- either a server-first banner
+        (SSH/FTP send one unprompted) or, if nothing arrives unprompted,
+        a reply to a generic HTTP GET. A reset while waiting for either,
+        or no response from either probe, means this attempt was not
+        ready (caller retries)."""
+        try:
+            with socket.create_connection((host, port), timeout=1.0) as s:
+                s.settimeout(1.0)
+                try:
                     data = s.recv(16)
                     if data:
-                        return
-                    last_error = RuntimeError("connection accepted but no response to probe")
-            except OSError as e:
-                last_error = e
-            time.sleep(0.5)
-        raise RuntimeError(f"port {host}:{port} never produced a real response within {timeout_seconds}s ({last_error})")
+                        return True
+                    return False  # connection closed with no data
+                except TimeoutError:
+                    pass  # no server-first banner -- try an HTTP probe below
+
+                s.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+                data = s.recv(16)
+                return bool(data)
+        except OSError:
+            return False
+
+    # _tcp_probe_attempt's banner-or-GET dance exists ONLY because of
+    # Docker's userland-proxy, which sits in front of a *published* host
+    # port and accepts the TCP handshake immediately on the host side
+    # even before anything inside the container is listening yet, then
+    # resets once it tries (and fails) to reach a real listener -- so a
+    # bare connect() against a published port can "succeed" well before
+    # the real service is up (see _wait_for_service's own docstring).
+    # Internal-only hosts have no published port and no userland-proxy
+    # in the path at all: this exec's connection is a plain
+    # container-to-container hop over the bridge network straight to
+    # the target container's own kernel socket, so a successful
+    # connect() here already means a real listener accepted it -- no
+    # NAT/proxy layer to be fooled by. Trying to layer the SAME
+    # banner-or-GET heuristic on top here was tried and is actively
+    # wrong, not just unnecessary: confirmed by direct reproduction
+    # against Expert's `directory` host, real OpenLDAP slapd on 389,
+    # which never sends an unprompted banner and silently ignores (or
+    # drops the connection on) a garbage HTTP GET -- so that version of
+    # this probe timed out on every attempt forever, even once slapd was
+    # genuinely up and accepting connections, misreporting a perfectly
+    # healthy service as never-ready. `timeout 5` wraps the whole script
+    # as a last-resort guard in case /dev/tcp's connect itself blocks
+    # instead of being refused immediately (not expected on a Docker
+    # bridge network, but cheap insurance).
+    _EXEC_PROBE_SCRIPT = r"""
+host="$1"; port="$2"
+exec 3<>"/dev/tcp/${host}/${port}" 2>/dev/null && exit 0
+exit 1
+"""
+
+    def _exec_probe_attempt(self, front_door_container, host: str, port: int) -> bool:
+        exit_code, _output = front_door_container.exec_run(
+            ["timeout", "5", "bash", "-c", self._EXEC_PROBE_SCRIPT, "probe", host, str(port)],
+            demux=False,
+        )
+        return exit_code == 0
 
     def _get_or_create_network(self, name: str, internal: bool = False):
         try:
