@@ -234,6 +234,50 @@ class KubernetesBackend(RuntimeBackend):
         env_list = [k8s_client.V1EnvVar(name=k, value=v) for k, v in env.items()]
         labels = {"app": host_spec.name, "ctf-instance": f"{instance.box_id}-{instance.team_id}"}
 
+        # A real k8s readinessProbe -- the gap this whole function used to
+        # have is exactly what let Expert-the-annex's `directory` host
+        # (OpenLDAP slapd) go undetected while crash-looping under k8s:
+        # supervisord (pid 1) never died even while slapd, its CHILD, kept
+        # dying and restarting every few seconds, so the pod's Ready
+        # condition -- driven purely by "container process is alive" with
+        # no probe at all -- stayed true the entire time. A tcpSocket
+        # probe makes "Ready" mean "something is actually accepting
+        # connections on this port" instead, for every host (front door
+        # included), not just the published NodePort that
+        # _wait_for_service already protocol-probes from outside the
+        # cluster. This is also why _wait_for_deployment_ready below reads
+        # available_replicas (which respects minReadySeconds) rather than
+        # ready_replicas (an instantaneous snapshot): a port that flaps
+        # up/down every few seconds could otherwise still show
+        # ready_replicas>=1 in the exact instant our poll loop happens to
+        # sample it, which is precisely the kind of flapping crash loop
+        # that bit us.
+        #
+        # V1Container only accepts a single readiness_probe, so when a
+        # host declares more than one port we probe the first declared
+        # TCP port -- every current box spec's internal-only hosts (the
+        # ones with no other readiness signal at all) declare exactly one
+        # port, and multi-port hosts are always the front door, which
+        # already gets its own stronger protocol-aware check via
+        # _wait_for_service on the externally published port.
+        tcp_ports = [p for p in host_spec.ports if p.protocol.lower() == "tcp"]
+        readiness_probe = None
+        if tcp_ports:
+            readiness_probe = k8s_client.V1Probe(
+                tcp_socket=k8s_client.V1TCPSocketAction(port=tcp_ports[0].container_port),
+                initial_delay_seconds=3,
+                period_seconds=3,
+                timeout_seconds=3,
+                # Generous enough (~9-12s of unbroken failure) to ride out
+                # this host's own CPU-contention-induced transient probe
+                # delays without flagging a healthy service as not-ready,
+                # while still reliably catching a service that crash-loops
+                # every few seconds (3 consecutive misses can't land
+                # inside a single live window of one of those loops).
+                failure_threshold=3,
+                success_threshold=1,
+            )
+
         container = k8s_client.V1Container(
             name=host_spec.name,
             image=host_spec.image,
@@ -245,6 +289,7 @@ class KubernetesBackend(RuntimeBackend):
             image_pull_policy="IfNotPresent",
             env=env_list,
             ports=[k8s_client.V1ContainerPort(container_port=p.container_port) for p in host_spec.ports],
+            readiness_probe=readiness_probe,
         )
         template = k8s_client.V1PodTemplateSpec(
             metadata=k8s_client.V1ObjectMeta(labels=labels),
@@ -256,6 +301,12 @@ class KubernetesBackend(RuntimeBackend):
                 replicas=1,
                 selector=k8s_client.V1LabelSelector(match_labels={"app": host_spec.name}),
                 template=template,
+                # Requires the Ready condition to hold continuously for
+                # 10s before a pod counts toward available_replicas --
+                # see the readiness_probe comment above for why an
+                # instantaneous Ready snapshot isn't trustworthy on its
+                # own.
+                min_ready_seconds=10,
             ),
         )
         self._apps.create_namespaced_deployment(namespace, deployment)
@@ -345,12 +396,25 @@ class KubernetesBackend(RuntimeBackend):
         self._net.create_namespaced_network_policy(namespace, allow_external)
 
     def _wait_for_deployment_ready(self, namespace: str, name: str, timeout_seconds: float = 120.0) -> None:
+        """Waits for available_replicas >= 1, NOT ready_replicas.
+        ready_replicas is an instantaneous snapshot of the Pod's Ready
+        condition -- a service that's crash-looping every few seconds
+        (see _create_deployment's readiness_probe comment for the real
+        incident this is about) can still show ready_replicas>=1 at the
+        exact moment this loop happens to poll it. available_replicas only
+        counts a pod once its Ready condition has held continuously for
+        the Deployment's min_ready_seconds, which is what actually rules
+        out that class of flapping false-positive. Combined with the
+        tcpSocket readinessProbe added to every host's container, this is
+        real service-level verification -- not just "the process is
+        alive" -- for every host in the box, internal-only hosts included,
+        not just the front door's own externally-probed NodePort."""
         deadline = time.monotonic() + timeout_seconds
         last_status = None
         while time.monotonic() < deadline:
             dep = self._apps.read_namespaced_deployment(name, namespace)
             last_status = dep.status
-            if dep.status.ready_replicas and dep.status.ready_replicas >= 1:
+            if dep.status.available_replicas and dep.status.available_replicas >= 1:
                 return
             time.sleep(1)
         raise RuntimeError(f"deployment {namespace}/{name} never became ready within {timeout_seconds}s ({last_status})")
@@ -422,7 +486,13 @@ class KubernetesBackend(RuntimeBackend):
             if e.status == 404:
                 return "destroyed"
             raise
-        healthy = all((d.status.ready_replicas or 0) >= 1 for d in deployments)
+        # available_replicas, not ready_replicas -- same reasoning as
+        # _wait_for_deployment_ready: ready_replicas is an instantaneous
+        # snapshot that a flapping/crash-looping service can still
+        # satisfy, available_replicas requires the Ready condition (now
+        # backed by each container's tcpSocket readinessProbe) to have
+        # held for min_ready_seconds.
+        healthy = all((d.status.available_replicas or 0) >= 1 for d in deployments)
         return "running" if healthy else "error"
 
     # ---- destroy -----------------------------------------------------------
