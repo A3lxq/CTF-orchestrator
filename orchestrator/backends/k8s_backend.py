@@ -1,6 +1,8 @@
 import asyncio
+import contextlib
 import re
 import socket
+import threading
 import time
 
 from kubernetes import client as k8s_client
@@ -69,7 +71,15 @@ class KubernetesBackend(RuntimeBackend):
         self._core = k8s_client.CoreV1Api()
         self._apps = k8s_client.AppsV1Api()
         self._net = k8s_client.NetworkingV1Api()
-        self._alloc_lock = asyncio.Lock()
+        # A real threading.Lock, not asyncio.Lock -- _provision_sync runs
+        # in a worker thread (via asyncio.to_thread), not a coroutine, so
+        # an asyncio.Lock can't be correctly acquired here at all. Same
+        # fix, same reasoning, as DockerBackend's own _alloc_lock: a
+        # NodePort is picked from a live snapshot (_used_node_ports) with
+        # nothing stopping two concurrent provisions from picking the same
+        # "free" port before either has actually committed it via
+        # _create_service.
+        self._alloc_lock = threading.Lock()
         self._node_address_cache: str | None = None
 
     # ---- provision -----------------------------------------------------
@@ -86,9 +96,19 @@ class KubernetesBackend(RuntimeBackend):
         front_door_port: int | None = None
 
         for host_spec in spec.hosts:
-            svc_ports, node_port_env = self._allocate_host_ports(host_spec, used_node_ports)
-            self._create_deployment(namespace, host_spec, team_secret, instance, node_port_env)
-            service = self._create_service(namespace, host_spec, svc_ports)
+            # Only a front-door host actually allocates a NodePort from
+            # the shared pool (internal-only hosts get a plain ClusterIP,
+            # no race possible) -- see __init__'s comment on _alloc_lock.
+            # Held across refresh-snapshot + allocate + the _create_service
+            # call that actually commits the NodePort to the k8s API,
+            # since that's the real moment a stale snapshot could collide.
+            lock = self._alloc_lock if host_spec.front_door else contextlib.nullcontext()
+            with lock:
+                if host_spec.front_door:
+                    used_node_ports |= self._used_node_ports()
+                svc_ports, node_port_env = self._allocate_host_ports(host_spec, used_node_ports)
+                self._create_deployment(namespace, host_spec, team_secret, instance, node_port_env)
+                service = self._create_service(namespace, host_spec, svc_ports)
 
             if host_spec.front_door:
                 # Prefer port 80 as "the" single entry port when present,

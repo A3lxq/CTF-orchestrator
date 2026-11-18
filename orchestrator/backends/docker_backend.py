@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import socket
+import threading
 import time
 
 import docker
@@ -24,7 +26,19 @@ class DockerBackend(RuntimeBackend):
 
     def __init__(self):
         self._client = docker.from_env()
-        self._alloc_lock = asyncio.Lock()
+        # A real threading.Lock, not asyncio.Lock -- _start_host runs in a
+        # worker thread (via asyncio.to_thread), not a coroutine, so an
+        # asyncio.Lock can't be correctly acquired here at all. Serializes
+        # port allocation + the front-door container's create+start across
+        # EVERY concurrent provision call on this backend (see _start_host):
+        # _used_host_ports() is a snapshot of live Docker state, and
+        # nothing else stops two concurrent provisions from both reading
+        # the same "port N is free" snapshot before either has actually
+        # bound it -- confirmed by direct reproduction (concurrent
+        # POST /instances calls with distinct team_ids, no naming
+        # collision involved, still raced on the same port and one lost
+        # with Docker's own "port is already allocated" error).
+        self._alloc_lock = threading.Lock()
 
     def _used_host_ports(self) -> set[int]:
         """Ports currently bound by ANY container on this host, derived
@@ -358,95 +372,115 @@ exit 1
         return f"{network_name}-internal-{group}"
 
     def _start_host(self, instance, host_spec: HostSpec, team_secret: str, pub_network, internal_networks: dict, used_ports: set[int]):
-        env = {"CTF_SECRET": team_secret, **host_spec.extra_env}
-        ports: dict[str, int] = {}
+        # Only a front-door host actually consumes host ports from the
+        # shared pool, so only it needs _alloc_lock -- held across the
+        # ENTIRE allocate-through-start sequence below (not just the
+        # allocation), since the real race is between picking a port from
+        # a live-but-stale snapshot and Docker actually binding it at
+        # start() time. An internal-only host's create+start never touches
+        # the port pool and runs fully unlocked/concurrently, same as
+        # before.
+        lock = self._alloc_lock if host_spec.front_door else contextlib.nullcontext()
+        with lock:
+            if host_spec.front_door:
+                # Refresh the snapshot NOW, holding the lock -- the
+                # `used_ports` passed in (captured once per _provision_sync
+                # call, before this lock was acquired) can already be
+                # stale by the time we get here: another thread may have
+                # bound a port in between. Merging in a fresh read closes
+                # that window; see __init__'s comment on _alloc_lock for
+                # the failure this fixes (confirmed by direct reproduction).
+                used_ports |= self._used_host_ports()
 
-        if host_spec.front_door:
-            for p in host_spec.ports:
-                host_port = self._allocate_single_port(used_ports)
-                ports[f"{p.container_port}/{p.protocol}"] = host_port
-                # The first port in the spec's list is treated as "the"
-                # entry port by the caller (_provision_sync reads it back
-                # off the container's own port bindings after start).
+            env = {"CTF_SECRET": team_secret, **host_spec.extra_env}
+            ports: dict[str, int] = {}
 
-            if host_spec.pasv_range:
-                size = host_spec.pasv_range.container_max - host_spec.pasv_range.container_min + 1
-                range_start, range_end = self._allocate_port_range(size, used_ports)
-                for offset in range(size):
-                    ports[f"{range_start + offset}/tcp"] = range_start + offset
-                env[host_spec.pasv_range.env_min_var] = str(range_start)
-                env[host_spec.pasv_range.env_max_var] = str(range_end)
-                if host_spec.pasv_range.env_address_var:
-                    env[host_spec.pasv_range.env_address_var] = config.DOCKER_HOST_PUBLIC_ADDRESS
-                # vsftpd needs its OWN internal listen range to match the
-                # host-mapped numbers 1:1 (passive mode announces a raw
-                # port number to the client with no NAT-aware translation),
-                # so container_port == host_port for every pasv port here.
+            if host_spec.front_door:
+                for p in host_spec.ports:
+                    host_port = self._allocate_single_port(used_ports)
+                    ports[f"{p.container_port}/{p.protocol}"] = host_port
+                    # The first port in the spec's list is treated as "the"
+                    # entry port by the caller (_provision_sync reads it back
+                    # off the container's own port bindings after start).
 
-        container_name = f"ctf-{instance.box_id}-{instance.team_id}-{host_spec.name}"[:63]
-        # Remove any stale container left behind from a previous failed run.
-        try:
-            stale = self._client.containers.get(container_name)
-            stale.remove(force=True)
-        except NotFound:
-            pass
+                if host_spec.pasv_range:
+                    size = host_spec.pasv_range.container_max - host_spec.pasv_range.container_min + 1
+                    range_start, range_end = self._allocate_port_range(size, used_ports)
+                    for offset in range(size):
+                        ports[f"{range_start + offset}/tcp"] = range_start + offset
+                    env[host_spec.pasv_range.env_min_var] = str(range_start)
+                    env[host_spec.pasv_range.env_max_var] = str(range_end)
+                    if host_spec.pasv_range.env_address_var:
+                        env[host_spec.pasv_range.env_address_var] = config.DOCKER_HOST_PUBLIC_ADDRESS
+                    # vsftpd needs its OWN internal listen range to match the
+                    # host-mapped numbers 1:1 (passive mode announces a raw
+                    # port number to the client with no NAT-aware translation),
+                    # so container_port == host_port for every pasv port here.
 
-        # Primary network at create()-time: pub_network for the front door
-        # (so its published ports bind there), else its first listed
-        # internal group -- falling back to pub_network only if this box
-        # has no internal networks at all (single-host boxes).
-        primary_network = pub_network
-        if not host_spec.front_door and internal_networks:
-            primary_network = internal_networks.get(host_spec.internal_groups[0], pub_network)
+            container_name = f"ctf-{instance.box_id}-{instance.team_id}-{host_spec.name}"[:63]
+            # Remove any stale container left behind from a previous failed run.
+            try:
+                stale = self._client.containers.get(container_name)
+                stale.remove(force=True)
+            except NotFound:
+                pass
 
-        container = self._client.containers.create(
-            image=host_spec.image,
-            name=container_name,
-            environment=env,
-            ports=ports if host_spec.front_door else None,
-            network=primary_network.name,
-            detach=True,
-        )
-        # Several multi-host boxes' own intended solve path has the
-        # player, after pivoting in via the front door, type the box's
-        # ORIGINAL docker-compose service name as a literal hostname from
-        # an internal shell (e.g. `curl http://backoffice:6000/`,
-        # `ssh ops@fileserver`, `ssh traveler@vault`) -- this is baked
-        # into each box's own writeup, not something settable via an env
-        # var, so every network membership needs a DNS alias equal to
-        # host_spec.name (which is set to match the original compose
-        # service name in every box spec), not just the orchestrator's
-        # own ctf-<box_id>-<team_id>-<service> container name. The
-        # high-level create() API has no alias parameter, so connect
-        # once without one, then disconnect/reconnect with the alias --
-        # safe to do before start(): Docker's published-port NAT setup
-        # reads the container's network config at `start()` time, not at
-        # `create()` time, confirmed by direct test.
-        primary_network.disconnect(container)
-        primary_network.connect(container, aliases=[host_spec.name])
+            # Primary network at create()-time: pub_network for the front door
+            # (so its published ports bind there), else its first listed
+            # internal group -- falling back to pub_network only if this box
+            # has no internal networks at all (single-host boxes).
+            primary_network = pub_network
+            if not host_spec.front_door and internal_networks:
+                primary_network = internal_networks.get(host_spec.internal_groups[0], pub_network)
 
-        # Join every OTHER internal group this host lists beyond its
-        # primary one. For a front-door host that's every internal group
-        # it has (mirrors the original compose files' frontdesk/gateway
-        # services being members of both public-net and internal-net). For
-        # an internal-only host with more than one group -- a pivot like
-        # god-the-ferryman's waystation, joining both "segment-a" and
-        # "segment-b" -- that's every group after the first (its primary).
-        # A host that only ever lists one group (every box that doesn't
-        # opt into named segments) has nothing left here, same as today.
-        extra_groups = host_spec.internal_groups if host_spec.front_door else host_spec.internal_groups[1:]
-        for group in extra_groups:
-            net = internal_networks.get(group)
-            if net:
-                net.connect(container, aliases=[host_spec.name])
-        # Internal-only hosts were created with network=<their primary
-        # internal network>.name above and never joined to pub_network at
-        # all -- "no published ports, no route except via the front door"
-        # is simply never giving them a connection to pub_network, matching
-        # the original compose design's internal-only services exactly.
+            container = self._client.containers.create(
+                image=host_spec.image,
+                name=container_name,
+                environment=env,
+                ports=ports if host_spec.front_door else None,
+                network=primary_network.name,
+                detach=True,
+            )
+            # Several multi-host boxes' own intended solve path has the
+            # player, after pivoting in via the front door, type the box's
+            # ORIGINAL docker-compose service name as a literal hostname from
+            # an internal shell (e.g. `curl http://backoffice:6000/`,
+            # `ssh ops@fileserver`, `ssh traveler@vault`) -- this is baked
+            # into each box's own writeup, not something settable via an env
+            # var, so every network membership needs a DNS alias equal to
+            # host_spec.name (which is set to match the original compose
+            # service name in every box spec), not just the orchestrator's
+            # own ctf-<box_id>-<team_id>-<service> container name. The
+            # high-level create() API has no alias parameter, so connect
+            # once without one, then disconnect/reconnect with the alias --
+            # safe to do before start(): Docker's published-port NAT setup
+            # reads the container's network config at `start()` time, not at
+            # `create()` time, confirmed by direct test.
+            primary_network.disconnect(container)
+            primary_network.connect(container, aliases=[host_spec.name])
 
-        container.start()
-        return container
+            # Join every OTHER internal group this host lists beyond its
+            # primary one. For a front-door host that's every internal group
+            # it has (mirrors the original compose files' frontdesk/gateway
+            # services being members of both public-net and internal-net). For
+            # an internal-only host with more than one group -- a pivot like
+            # god-the-ferryman's waystation, joining both "segment-a" and
+            # "segment-b" -- that's every group after the first (its primary).
+            # A host that only ever lists one group (every box that doesn't
+            # opt into named segments) has nothing left here, same as today.
+            extra_groups = host_spec.internal_groups if host_spec.front_door else host_spec.internal_groups[1:]
+            for group in extra_groups:
+                net = internal_networks.get(group)
+                if net:
+                    net.connect(container, aliases=[host_spec.name])
+            # Internal-only hosts were created with network=<their primary
+            # internal network>.name above and never joined to pub_network at
+            # all -- "no published ports, no route except via the front door"
+            # is simply never giving them a connection to pub_network, matching
+            # the original compose design's internal-only services exactly.
+
+            container.start()
+            return container
 
     async def status(self, instance: Instance) -> str:
         return await asyncio.to_thread(self._status_sync, instance)
