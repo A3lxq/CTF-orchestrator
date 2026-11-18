@@ -32,6 +32,12 @@ import pytest
 import requests
 
 BASE_URL = os.environ.get("ORCHESTRATOR_TEST_URL", "http://127.0.0.1:9100")
+# Randomized once per process (not a fixed literal) so two pytest processes
+# running this file concurrently -- or even back-to-back, since Docker
+# container/network teardown is asynchronous and a DELETE returning 200
+# doesn't guarantee removal has actually finished -- never collide on the
+# same team_id-derived container names.
+_TEAM_ID_BASE = pysecrets.randbelow(1_000_000)
 
 # box_id -> front-door service/port/path (flag #1 location, verified
 # against each box's resurrected source) + internal-only hosts as
@@ -78,9 +84,9 @@ def two_teams(request):
     secret1 = pysecrets.token_hex(32)
     secret2 = pysecrets.token_hex(32)
 
-    r1 = requests.post(f"{BASE_URL}/instances", json={"team_id": 201, "box_id": box_id, "team_secret": secret1})
+    r1 = requests.post(f"{BASE_URL}/instances", json={"team_id": _TEAM_ID_BASE + 1, "box_id": box_id, "team_secret": secret1})
     r1.raise_for_status()
-    r2 = requests.post(f"{BASE_URL}/instances", json={"team_id": 202, "box_id": box_id, "team_secret": secret2})
+    r2 = requests.post(f"{BASE_URL}/instances", json={"team_id": _TEAM_ID_BASE + 2, "box_id": box_id, "team_secret": secret2})
     r2.raise_for_status()
 
     inst1, inst2 = r1.json(), r2.json()
@@ -115,8 +121,8 @@ def _exec(container_name: str, *cmd: str) -> subprocess.CompletedProcess:
 def test_flag_uniqueness(two_teams):
     box_id, inst1, inst2, secret1, secret2 = two_teams
     cfg = BOX_CONFIG[box_id]["front_door"]
-    fd1 = _front_door_container(box_id, 201)
-    fd2 = _front_door_container(box_id, 202)
+    fd1 = _front_door_container(box_id, _TEAM_ID_BASE + 1)
+    fd2 = _front_door_container(box_id, _TEAM_ID_BASE + 2)
     port1 = _published_port(fd1, cfg["port"])
     port2 = _published_port(fd2, cfg["port"])
 
@@ -133,7 +139,7 @@ def test_flag_uniqueness(two_teams):
 def test_internal_hosts_not_published(two_teams):
     box_id, inst1, _, _, _ = two_teams
     for service, _port in BOX_CONFIG[box_id]["internal"]:
-        name = _internal_container(box_id, 201, service)
+        name = _internal_container(box_id, _TEAM_ID_BASE + 1, service)
         out = subprocess.run(
             ["docker", "inspect", "-f", "{{json .NetworkSettings.Ports}}", name],
             capture_output=True, text=True, check=True,
@@ -149,7 +155,7 @@ def test_front_door_reaches_internal_hosts_by_alias(two_teams):
     player type the ORIGINAL compose service name, not the orchestrator's
     container name, from a shell on the front door."""
     box_id, inst1, _, _, _ = two_teams
-    fd1 = _front_door_container(box_id, 201)
+    fd1 = _front_door_container(box_id, _TEAM_ID_BASE + 1)
     for service, port in BOX_CONFIG[box_id].get("front_door_reachable", BOX_CONFIG[box_id]["internal"]):
         resolved = _exec(fd1, "getent", "hosts", service)
         assert resolved.returncode == 0, f"{box_id}: front door could not resolve internal hostname {service!r}: {resolved.stderr}"
@@ -163,9 +169,9 @@ def test_cross_team_internal_isolation(two_teams):
     same per-team guarantee Phase 0 proved for single-host boxes, now
     across the internal-net too."""
     box_id, inst1, inst2, _, _ = two_teams
-    fd1 = _front_door_container(box_id, 201)
+    fd1 = _front_door_container(box_id, _TEAM_ID_BASE + 1)
     for service, port in BOX_CONFIG[box_id]["internal"]:
-        team2_internal_name = _internal_container(box_id, 202, service)
+        team2_internal_name = _internal_container(box_id, _TEAM_ID_BASE + 2, service)
         ip_out = subprocess.run(
             ["docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}", team2_internal_name],
             capture_output=True, text=True, check=True,
@@ -178,12 +184,12 @@ def test_cross_team_internal_isolation(two_teams):
 @pytest.fixture
 def god_instance():
     """Single-team instance of god-the-ferryman specifically, for the chain-
-    topology checks below -- a fresh team_id (203) rather than reusing
-    two_teams' 201/202 so this never races/collides with that fixture's own
-    teardown for the same box."""
+    topology checks below -- a fresh offset (_TEAM_ID_BASE + 3) rather than
+    reusing two_teams' +1/+2 so this never races/collides with that
+    fixture's own teardown for the same box."""
     box_id = "god-the-ferryman"
     secret = pysecrets.token_hex(32)
-    r = requests.post(f"{BASE_URL}/instances", json={"team_id": 203, "box_id": box_id, "team_secret": secret})
+    r = requests.post(f"{BASE_URL}/instances", json={"team_id": _TEAM_ID_BASE + 3, "box_id": box_id, "team_secret": secret})
     r.raise_for_status()
     inst = r.json()
     try:
@@ -201,9 +207,9 @@ def test_god_chain_topology(god_instance):
     can. test_front_door_reaches_internal_hosts_by_alias above already
     confirms Portal can still reach Waystation, the one legal hop."""
     box_id = "god-the-ferryman"
-    portal = _front_door_container(box_id, 203)
-    waystation = _internal_container(box_id, 203, "waystation")
-    vault = _internal_container(box_id, 203, "vault")
+    portal = _front_door_container(box_id, _TEAM_ID_BASE + 3)
+    waystation = _internal_container(box_id, _TEAM_ID_BASE + 3, "waystation")
+    vault = _internal_container(box_id, _TEAM_ID_BASE + 3, "vault")
 
     # Portal cannot resolve or reach Vault by alias -- no shared segment.
     resolved = _exec(portal, "getent", "hosts", "vault")
@@ -236,7 +242,7 @@ def test_idempotent_create(two_teams):
     box_id, inst1, _, secret1, _ = two_teams
     r = requests.post(
         f"{BASE_URL}/instances",
-        json={"team_id": 201, "box_id": box_id, "team_secret": "a-different-secret-must-be-ignored"},
+        json={"team_id": _TEAM_ID_BASE + 1, "box_id": box_id, "team_secret": "a-different-secret-must-be-ignored"},
     )
     r.raise_for_status()
     assert r.json()["instance_id"] == inst1["instance_id"]
@@ -244,8 +250,8 @@ def test_idempotent_create(two_teams):
 
 def test_destroy_actually_tears_down(two_teams):
     box_id, inst1, _, _, _ = two_teams
-    all_names = [_front_door_container(box_id, 201)] + [
-        _internal_container(box_id, 201, s) for s, _p in BOX_CONFIG[box_id]["internal"]
+    all_names = [_front_door_container(box_id, _TEAM_ID_BASE + 1)] + [
+        _internal_container(box_id, _TEAM_ID_BASE + 1, s) for s, _p in BOX_CONFIG[box_id]["internal"]
     ]
     requests.delete(f"{BASE_URL}/instances/{inst1['instance_id']}").raise_for_status()
     time.sleep(1)

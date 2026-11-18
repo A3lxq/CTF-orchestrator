@@ -27,6 +27,12 @@ import pytest
 import requests
 
 BASE_URL = os.environ.get("ORCHESTRATOR_TEST_URL", "http://127.0.0.1:9100")
+# Randomized once per process (not a fixed literal) so two pytest processes
+# running this file concurrently -- or even back-to-back, since Docker
+# container/network teardown is asynchronous and a DELETE returning 200
+# doesn't guarantee removal has actually finished -- never collide on the
+# same team_id-derived container names.
+_TEAM_ID_BASE = pysecrets.randbelow(1_000_000)
 
 # box_id -> (front-door service name, published port to probe, path whose
 # response body contains flag #1). Verified directly against each box's
@@ -63,9 +69,9 @@ def two_teams(request):
     secret1 = pysecrets.token_hex(32)
     secret2 = pysecrets.token_hex(32)
 
-    r1 = requests.post(f"{BASE_URL}/instances", json={"team_id": 101, "box_id": box_id, "team_secret": secret1})
+    r1 = requests.post(f"{BASE_URL}/instances", json={"team_id": _TEAM_ID_BASE + 1, "box_id": box_id, "team_secret": secret1})
     r1.raise_for_status()
-    r2 = requests.post(f"{BASE_URL}/instances", json={"team_id": 102, "box_id": box_id, "team_secret": secret2})
+    r2 = requests.post(f"{BASE_URL}/instances", json={"team_id": _TEAM_ID_BASE + 2, "box_id": box_id, "team_secret": secret2})
     r2.raise_for_status()
 
     inst1, inst2 = r1.json(), r2.json()
@@ -94,8 +100,8 @@ def test_flag_uniqueness(two_teams):
 def test_network_isolation(two_teams):
     box_id, inst1, inst2, _, _ = two_teams
     cfg = BOX_CONFIG[box_id]
-    name1 = f"ctf-{box_id}-101-{cfg['service']}"
-    name2 = f"ctf-{box_id}-102-{cfg['service']}"
+    name1 = f"ctf-{box_id}-{_TEAM_ID_BASE + 1}-{cfg['service']}"
+    name2 = f"ctf-{box_id}-{_TEAM_ID_BASE + 2}-{cfg['service']}"
     ip1 = _internal_ip(name1)
     ip2 = _internal_ip(name2)
 
@@ -108,7 +114,7 @@ def test_idempotent_create(two_teams):
     box_id, inst1, _, secret1, _ = two_teams
     r = requests.post(
         f"{BASE_URL}/instances",
-        json={"team_id": 101, "box_id": box_id, "team_secret": "a-different-secret-must-be-ignored"},
+        json={"team_id": _TEAM_ID_BASE + 1, "box_id": box_id, "team_secret": "a-different-secret-must-be-ignored"},
     )
     r.raise_for_status()
     assert r.json()["instance_id"] == inst1["instance_id"], "re-request for same (team_id, box_id) must attach, not re-provision"
@@ -117,7 +123,7 @@ def test_idempotent_create(two_teams):
 def test_destroy_actually_tears_down(two_teams):
     box_id, inst1, _, _, _ = two_teams
     cfg = BOX_CONFIG[box_id]
-    name1 = f"ctf-{box_id}-101-{cfg['service']}"
+    name1 = f"ctf-{box_id}-{_TEAM_ID_BASE + 1}-{cfg['service']}"
     requests.delete(f"{BASE_URL}/instances/{inst1['instance_id']}").raise_for_status()
     time.sleep(1)
     result = subprocess.run(["docker", "inspect", name1], capture_output=True)

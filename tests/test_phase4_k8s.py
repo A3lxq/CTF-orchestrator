@@ -31,6 +31,11 @@ import requests
 
 BASE_URL = os.environ.get("ORCHESTRATOR_TEST_URL", "http://127.0.0.1:9100")
 KUBECTL = os.environ.get("KUBECTL_BIN", "kubectl")
+# Randomized once per process (not a fixed literal) so two pytest processes
+# running this file concurrently -- or even back-to-back, since teardown is
+# asynchronous and a DELETE returning 200 doesn't guarantee the namespace is
+# actually gone yet -- never collide on the same team_id-derived namespace.
+_TEAM_ID_BASE = pysecrets.randbelow(1_000_000)
 
 # box_id -> front-door service/port/path (verified against each box's
 # resurrected source in Phases 2-3) + internal-only hosts as
@@ -93,11 +98,11 @@ def two_teams(request):
     secret2 = pysecrets.token_hex(32)
 
     r1 = requests.post(f"{BASE_URL}/instances", json={
-        "team_id": 801, "box_id": box_id, "team_secret": secret1, "backend": "kubernetes",
+        "team_id": _TEAM_ID_BASE + 1, "box_id": box_id, "team_secret": secret1, "backend": "kubernetes",
     })
     r1.raise_for_status()
     r2 = requests.post(f"{BASE_URL}/instances", json={
-        "team_id": 802, "box_id": box_id, "team_secret": secret2, "backend": "kubernetes",
+        "team_id": _TEAM_ID_BASE + 2, "box_id": box_id, "team_secret": secret2, "backend": "kubernetes",
     })
     r2.raise_for_status()
 
@@ -145,7 +150,7 @@ def test_flag_uniqueness(two_teams):
 
 def test_internal_hosts_have_no_node_port(two_teams):
     box_id, inst1, _, _, _ = two_teams
-    ns1 = _namespace(box_id, 801)
+    ns1 = _namespace(box_id, _TEAM_ID_BASE + 1)
     for service, _port in BOX_CONFIG[box_id]["internal"]:
         out = _kubectl("get", "svc", "-n", ns1, service, "-o", "jsonpath={.spec.type}")
         assert out.returncode == 0, out.stderr
@@ -154,7 +159,7 @@ def test_internal_hosts_have_no_node_port(two_teams):
 
 def test_front_door_reaches_internal_hosts_by_name(two_teams):
     box_id, inst1, _, _, _ = two_teams
-    ns1 = _namespace(box_id, 801)
+    ns1 = _namespace(box_id, _TEAM_ID_BASE + 1)
     fd_service = BOX_CONFIG[box_id]["front_door"]["service"]
     for service, port in BOX_CONFIG[box_id].get("front_door_reachable", BOX_CONFIG[box_id]["internal"]):
         reach = _kubectl(
@@ -169,8 +174,8 @@ def test_cross_team_isolation(two_teams):
     ipBlock exclusion + externalTrafficPolicy=Local fix, team A's pod
     could reach team B's pod directly, cross-namespace."""
     box_id, inst1, inst2, _, _ = two_teams
-    ns1 = _namespace(box_id, 801)
-    ns2 = _namespace(box_id, 802)
+    ns1 = _namespace(box_id, _TEAM_ID_BASE + 1)
+    ns2 = _namespace(box_id, _TEAM_ID_BASE + 2)
     fd_service = BOX_CONFIG[box_id]["front_door"]["service"]
     fd_port = BOX_CONFIG[box_id]["front_door"]["port"]
 
@@ -191,13 +196,13 @@ def test_cross_team_isolation(two_teams):
 @pytest.fixture
 def god_instance():
     """Single-team instance of god-the-ferryman specifically, for the chain-
-    topology check below -- a fresh team_id (803) rather than reusing
-    two_teams' 801/802 so this never races/collides with that fixture's own
-    teardown for the same box."""
+    topology check below -- a fresh offset (_TEAM_ID_BASE + 3) rather than
+    reusing two_teams' +1/+2 so this never races/collides with that
+    fixture's own teardown for the same box."""
     box_id = "god-the-ferryman"
     secret = pysecrets.token_hex(32)
     r = requests.post(f"{BASE_URL}/instances", json={
-        "team_id": 803, "box_id": box_id, "team_secret": secret, "backend": "kubernetes",
+        "team_id": _TEAM_ID_BASE + 3, "box_id": box_id, "team_secret": secret, "backend": "kubernetes",
     })
     r.raise_for_status()
     inst = r.json()
@@ -215,7 +220,7 @@ def test_god_chain_topology(god_instance):
     any-pod-to-any-pod namespace -- Portal must NOT reach Vault directly,
     only Waystation (the pivot) can."""
     box_id = "god-the-ferryman"
-    ns = _namespace(box_id, 803)
+    ns = _namespace(box_id, _TEAM_ID_BASE + 3)
 
     blocked = _kubectl(
         "exec", "-n", ns, "deploy/portal", "--",
@@ -239,7 +244,7 @@ def test_god_chain_topology(god_instance):
 def test_idempotent_create(two_teams):
     box_id, inst1, _, secret1, _ = two_teams
     r = requests.post(f"{BASE_URL}/instances", json={
-        "team_id": 801, "box_id": box_id, "team_secret": "a-different-secret-must-be-ignored",
+        "team_id": _TEAM_ID_BASE + 1, "box_id": box_id, "team_secret": "a-different-secret-must-be-ignored",
         "backend": "kubernetes",
     })
     r.raise_for_status()
@@ -248,7 +253,7 @@ def test_idempotent_create(two_teams):
 
 def test_destroy_actually_tears_down(two_teams):
     box_id, inst1, _, _, _ = two_teams
-    ns1 = _namespace(box_id, 801)
+    ns1 = _namespace(box_id, _TEAM_ID_BASE + 1)
     requests.delete(f"{BASE_URL}/instances/{inst1['instance_id']}").raise_for_status()
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
