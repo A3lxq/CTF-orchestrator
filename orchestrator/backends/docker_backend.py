@@ -89,6 +89,9 @@ class DockerBackend(RuntimeBackend):
         return await asyncio.to_thread(self._provision_sync, instance, spec, team_secret)
 
     def _provision_sync(self, instance: Instance, spec: BoxSpec, team_secret: str) -> ProvisionResult:
+        if spec.nested_docker:
+            return self._provision_nested_docker_sync(instance, spec, team_secret)
+
         network_name = f"ctf-{spec.box_id}-{instance.team_id}"
 
         pub_network = self._get_or_create_network(network_name)
@@ -239,6 +242,131 @@ class DockerBackend(RuntimeBackend):
             entry_port=front_door_host_port,
             hosts=provisioned,
         )
+
+    def _provision_nested_docker_sync(
+        self, instance: Instance, spec: BoxSpec, team_secret: str
+    ) -> ProvisionResult:
+        """For a box whose NestedDockerSpec is set (see registry.py) --
+        its entire stack runs inside ONE disposable nested Docker daemon
+        per instance, instead of as top-level containers on this
+        backend's real daemon. This is how a box that needs genuine
+        Docker-socket access as part of its own puzzle (currently only
+        legendary-ferrymans-relay) can be hosted on this shared,
+        multi-tenant orchestrator at all: the escalation lands in that
+        one team's own throwaway daemon, never the real shared one.
+        Returns exactly ONE ProvisionedHost (the front door) -- every
+        real container for this instance lives inside that single outer
+        container, so there's nothing for 3-4 separate rows to usefully
+        distinguish."""
+        nd = spec.nested_docker
+        front_door = spec.front_door_host
+
+        used_ports = self._used_host_ports()
+        with self._alloc_lock:
+            # Same race-safety reasoning as _start_host's own lock usage:
+            # refresh the snapshot now, holding the lock, right before
+            # allocating -- see __init__'s comment on _alloc_lock.
+            used_ports |= self._used_host_ports()
+            port_map: dict[str, int] = {
+                f"{p.container_port}/{p.protocol}": self._allocate_single_port(used_ports)
+                for p in front_door.ports
+            }
+            container_name = f"ctf-{instance.box_id}-{instance.team_id}-outer"[:63]
+            try:
+                stale = self._client.containers.get(container_name)
+                stale.remove(force=True)
+            except NotFound:
+                pass
+            # Deliberately no `network=` kwarg at all -- this outer
+            # container never joins pub_network/internal_networks. Nothing
+            # outside it talks to it except via its own published ports
+            # (handled by plain Docker `-p`, same as any front door) and
+            # via `exec` from this orchestrator host.
+            container = self._client.containers.create(
+                image=nd.outer_image,
+                name=container_name,
+                privileged=nd.privileged,
+                ports=port_map,
+                environment={"CTF_SECRET": team_secret},
+                detach=True,
+            )
+            container.start()
+
+        self._wait_for_nested_dockerd(container, nd.dockerd_ready_timeout_seconds)
+
+        images = {h.name: h.image for h in spec.hosts if h.nested_docker}
+        self._preload_nested_images(container, list(images.values()) + nd.extra_preload_images)
+
+        from .nested_stacks import BRING_UPS
+
+        BRING_UPS[spec.box_id](container, team_secret, images)
+
+        container.reload()
+        ports = container.attrs.get("NetworkSettings", {}).get("Ports") or {}
+        front_door_host_port: int | None = None
+        front_door_all_host_ports: list[int] = []
+        preferred_order = sorted(front_door.ports, key=lambda p: p.container_port != 80)
+        for p in preferred_order:
+            bindings = ports.get(f"{p.container_port}/{p.protocol}")
+            if bindings:
+                port_num = int(bindings[0]["HostPort"])
+                front_door_all_host_ports.append(port_num)
+                if front_door_host_port is None:
+                    front_door_host_port = port_num
+        if front_door_host_port is None:
+            raise RuntimeError("nested-docker front door did not come up with an expected published port")
+
+        # Same readiness probe every other front door uses, unchanged --
+        # the outer container's published port is a real bound port on
+        # this real host regardless of what's nested behind it.
+        for port_num in front_door_all_host_ports:
+            self._wait_for_service(config.DOCKER_HOST_PUBLIC_ADDRESS, port_num)
+
+        return ProvisionResult(
+            network_name=f"ctf-{instance.box_id}-{instance.team_id}",
+            entry_host=config.DOCKER_HOST_PUBLIC_ADDRESS,
+            entry_port=front_door_host_port,
+            hosts=[
+                ProvisionedHost(
+                    service_name=front_door.name,
+                    container_ref=container.id,
+                    internal_ip=None,
+                    is_front_door=True,
+                )
+            ],
+        )
+
+    def _wait_for_nested_dockerd(self, container, timeout_seconds: float) -> None:
+        """Cold nested-dockerd init is much slower than anything else this
+        backend waits on -- confirmed empirically (~1s on this host, but
+        that's not a guarantee under load elsewhere), hence this gets its
+        own, longer timeout rather than reusing _wait_for_service's 30s
+        default."""
+        self._retry_probe(
+            lambda: container.exec_run(["docker", "info"])[0] == 0,
+            timeout_seconds,
+            "nested dockerd",
+        )
+
+    def _preload_nested_images(self, container, images: list[str]) -> None:
+        """Loads each image into the nested daemon via `docker save |
+        docker exec -i <container> docker load` -- the nested daemon has
+        no internet egress on this platform, so anything it might need
+        (this box's own 3 images, plus e.g. "alpine" that the PLAYER
+        spins up fresh via the escaped socket) must already be there.
+        This shells out to the real `docker` CLI binary on the
+        orchestrator host, not just the daemon the Python SDK talks to --
+        there's no clean SDK-only primitive for piping a save into a
+        running container's exec stdin."""
+        import shlex
+        import subprocess
+
+        for image in images:
+            subprocess.run(
+                ["sh", "-c", f"docker save {shlex.quote(image)} | docker exec -i {shlex.quote(container.name)} docker load"],
+                check=True,
+                timeout=120,
+            )
 
     def _wait_for_service(self, host: str, port: int, timeout_seconds: float = 30.0) -> None:
         """Protocol-agnostic readiness probe, for a host-reachable
@@ -486,6 +614,10 @@ exit 1
         return await asyncio.to_thread(self._status_sync, instance)
 
     def _status_sync(self, instance: Instance) -> str:
+        # For a nested-docker box (registry.py's NestedDockerSpec),
+        # instance.hosts has exactly one row (the outer container) --
+        # "is the outer container running" is a correct, if coarse, signal
+        # (it says nothing about the nested stack's own health).
         try:
             healthy = True
             for host in instance.hosts:
@@ -500,6 +632,14 @@ exit 1
         await asyncio.to_thread(self._destroy_sync, instance)
 
     def _destroy_sync(self, instance: Instance) -> None:
+        # For a nested-docker box, force-removing the one outer container
+        # below tears down its entire nested daemon (all nested containers,
+        # networks, volumes) as part of removing that container's own
+        # writable layer/storage-driver state -- no separate per-nested-
+        # resource cleanup needed. The network cleanup further below is a
+        # no-op for these instances (nested-docker provisioning never
+        # creates a Docker-level network at this backend's own level), via
+        # the existing try/except NotFound already wrapping it.
         for host in instance.hosts:
             try:
                 c = self._client.containers.get(host.container_ref)

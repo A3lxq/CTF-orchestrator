@@ -45,12 +45,43 @@ class HostSpec:
     # Portal<->Vault reachability, mirroring that box's original VM-build
     # topology).
     internal_groups: list[str] = field(default_factory=lambda: ["internal"])
+    # True only on a BoxSpec that also sets `nested_docker` (see below) --
+    # marks this host as "no top-level container of its own," just an
+    # image to preload into, and run inside, the box's one outer dind
+    # container. Meaningless (and never checked) on a box that doesn't set
+    # BoxSpec.nested_docker.
+    nested_docker: bool = False
+
+
+@dataclass
+class NestedDockerSpec:
+    """Present only on a box whose own design needs real Docker-socket
+    access as part of the puzzle (currently: legendary-ferrymans-relay).
+    Rather than exposing the real per-host Docker daemon to any team's
+    container -- which on this shared, multi-tenant orchestrator would
+    hand that team control over every OTHER team's containers too, not a
+    contained escalation -- the box's entire stack runs inside one
+    disposable nested Docker daemon per instance instead. See
+    docker_backend.py's _provision_nested_docker_sync for the actual
+    bring-up; see legendary-ferrymans-relay.yaml for the motivating case.
+    """
+
+    outer_image: str
+    privileged: bool = True
+    dockerd_ready_timeout_seconds: float = 90.0
+    # Any image besides this box's own HostSpec images that the nested
+    # bring-up script needs preloaded (e.g. "alpine:latest", spun up fresh
+    # by the player via the escaped socket) -- the nested daemon has no
+    # internet egress, so anything it might need to `docker run` must be
+    # preloaded, not pulled live.
+    extra_preload_images: list[str] = field(default_factory=list)
 
 
 @dataclass
 class BoxSpec:
     box_id: str
     hosts: list[HostSpec]
+    nested_docker: NestedDockerSpec | None = None
 
     @property
     def is_multi_host(self) -> bool:
@@ -76,6 +107,18 @@ def _parse_host(raw: dict) -> HostSpec:
         pasv_range=pasv,
         extra_env=raw.get("extra_env", {}),
         internal_groups=list(raw.get("internal_groups") or ["internal"]),
+        nested_docker=raw.get("nested_docker", False),
+    )
+
+
+def _parse_nested_docker(raw: dict | None) -> NestedDockerSpec | None:
+    if not raw:
+        return None
+    return NestedDockerSpec(
+        outer_image=raw["outer_image"],
+        privileged=raw.get("privileged", True),
+        dockerd_ready_timeout_seconds=raw.get("dockerd_ready_timeout_seconds", 90.0),
+        extra_preload_images=list(raw.get("extra_preload_images") or []),
     )
 
 
@@ -83,7 +126,11 @@ def load_spec(path: str) -> BoxSpec:
     with open(path) as f:
         raw = yaml.safe_load(f)
     hosts = [_parse_host(h) for h in raw["hosts"]]
-    spec = BoxSpec(box_id=raw["box_id"], hosts=hosts)
+    spec = BoxSpec(
+        box_id=raw["box_id"],
+        hosts=hosts,
+        nested_docker=_parse_nested_docker(raw.get("nested_docker")),
+    )
     if not any(h.front_door for h in spec.hosts):
         raise ValueError(f"box {spec.box_id} spec has no front_door host")
     return spec

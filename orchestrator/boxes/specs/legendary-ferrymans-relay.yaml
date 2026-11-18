@@ -1,0 +1,35 @@
+box_id: legendary-ferrymans-relay
+# This box's own design needs real Docker-socket access as part of the
+# puzzle (vault's container-escape step). On this shared, multi-tenant
+# orchestrator that's safe only if it's scoped to one team's own
+# disposable nested Docker daemon, never the real host's -- see
+# registry.py's NestedDockerSpec and docker_backend.py's
+# _provision_nested_docker_sync. outer_image/privileged settled by direct
+# empirical spike on this host (2026-11-18): docker:27-dind-rootless fails
+# outright here regardless of flags ("rootlesskit: fork/exec
+# /proc/self/exe: operation not permitted") -- plain privileged dind is
+# what actually works.
+nested_docker:
+  outer_image: docker:27-dind
+  privileged: true
+  dockerd_ready_timeout_seconds: 90
+  extra_preload_images: ["alpine:latest"]
+hosts:
+  # None of these are real top-level containers -- see HostSpec.nested_docker
+  # and the module docstring on nested_stacks/legendary_ferrymans_relay.py.
+  # `front_door`/`ports` here are still meaningful: they're what
+  # _provision_nested_docker_sync reads to know which host port(s) to
+  # allocate and publish on the OUTER container.
+  - name: web
+    image: ctf-boxes/legendary-ferrymans-relay-web:latest
+    front_door: true
+    nested_docker: true
+    ports:
+      - {container_port: 5000}
+      - {container_port: 22}
+  - name: relay
+    image: ctf-boxes/legendary-ferrymans-relay-relay:latest
+    nested_docker: true
+  - name: vault
+    image: ctf-boxes/legendary-ferrymans-relay-vault:latest
+    nested_docker: true
