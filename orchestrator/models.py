@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     DateTime,
     Enum,
@@ -53,6 +54,14 @@ class Instance(Base):
     status: Mapped[InstanceStatus] = mapped_column(Enum(InstanceStatus), default=InstanceStatus.PENDING)
     entry_host: Mapped[str | None] = mapped_column(String(255), nullable=True)
     entry_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # [{service_name, container_port, host_port, protocol}, ...] -- every
+    # published front-door port, not just the single "entry" one above.
+    # Several boxes (noob-orientation-server, master-two-offices,
+    # veteran-aftermath, legendary-ferrymans-relay) publish a second port
+    # (commonly SSH alongside HTTP) that entry_port alone discarded.
+    # Nullable/absent for any instance provisioned before this column
+    # existed. See backends/base.py's PortBinding.
+    ports: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     destroyed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -12,7 +12,7 @@ from kubernetes.client.rest import ApiException
 from .. import config
 from ..boxes.registry import BoxSpec, HostSpec
 from ..models import Instance
-from .base import ProvisionedHost, ProvisionResult, RuntimeBackend
+from .base import PortBinding, ProvisionedHost, ProvisionResult, RuntimeBackend
 
 # The kubernetes-client SDK is sync-only (same situation as docker-py) --
 # every call into it below is wrapped in asyncio.to_thread so the async
@@ -94,6 +94,7 @@ class KubernetesBackend(RuntimeBackend):
         used_node_ports = self._used_node_ports()
         provisioned: list[ProvisionedHost] = []
         front_door_port: int | None = None
+        entry_ports: list[PortBinding] = []
 
         for host_spec in spec.hosts:
             # Only a front-door host actually allocates a NodePort from
@@ -119,7 +120,20 @@ class KubernetesBackend(RuntimeBackend):
                 for p in service.spec.ports:
                     if p.port == front_container_port:
                         front_door_port = p.node_port
-                        break
+                # Every published NodePort, not just the preferred one --
+                # same reasoning as DockerBackend's entry_ports (see
+                # base.py's PortBinding): a box like master-two-offices
+                # publishes SSH alongside HTTP, and entry_port alone can't
+                # represent that second port.
+                for p in service.spec.ports:
+                    entry_ports.append(
+                        PortBinding(
+                            service_name=host_spec.name,
+                            container_port=p.port,
+                            host_port=p.node_port,
+                            protocol=(p.protocol or "TCP").lower(),
+                        )
+                    )
 
             provisioned.append(
                 ProvisionedHost(
@@ -157,6 +171,7 @@ class KubernetesBackend(RuntimeBackend):
             entry_host=entry_host,
             entry_port=front_door_port,
             hosts=provisioned,
+            ports=entry_ports,
         )
 
     def _ensure_namespace(self, namespace: str) -> None:

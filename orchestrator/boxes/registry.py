@@ -152,5 +152,15 @@ class BoxRegistry:
     def reload(self) -> None:
         self._cache.clear()
 
+    def all_box_ids(self) -> list[str]:
+        return sorted(
+            fname[: -len(".yaml")]
+            for fname in os.listdir(self._specs_dir)
+            if fname.endswith(".yaml")
+        )
+
+    def all(self) -> list[BoxSpec]:
+        return [self.get(box_id) for box_id in self.all_box_ids()]
+
 
 registry = BoxRegistry()

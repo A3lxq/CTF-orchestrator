@@ -46,6 +46,7 @@ def _to_response(instance: Instance) -> InstanceResponse:
         status=instance.status.value,
         entry_host=instance.entry_host,
         entry_port=instance.entry_port,
+        ports=instance.ports,
         created_at=instance.created_at,
         expires_at=instance.expires_at,
     )
@@ -79,6 +80,25 @@ async def create_instance(req: CreateInstanceRequest):
             # than provisioning a duplicate.
             return _to_response(existing)
 
+        # Per-team cap, enforced only here -- a genuinely NEW instance --
+        # never on the idempotent reattach path above. Load-bearing now
+        # that ctf-platform's self-registration is open to anyone: a
+        # single anonymous signup could otherwise request all 8 boxes
+        # with no limit.
+        active_count = (
+            session.query(Instance)
+            .filter(
+                Instance.team_id == req.team_id,
+                Instance.status != InstanceStatus.DESTROYED,
+            )
+            .count()
+        )
+        if active_count >= config.MAX_INSTANCES_PER_TEAM:
+            raise HTTPException(
+                status_code=429,
+                detail=f"team already has {active_count} active instances (max {config.MAX_INSTANCES_PER_TEAM})",
+            )
+
         try:
             spec = registry.get(req.box_id)
         except KeyError as e:
@@ -108,6 +128,15 @@ async def create_instance(req: CreateInstanceRequest):
         instance.network_name = result.network_name
         instance.entry_host = result.entry_host
         instance.entry_port = result.entry_port
+        instance.ports = [
+            {
+                "service_name": p.service_name,
+                "container_port": p.container_port,
+                "host_port": p.host_port,
+                "protocol": p.protocol,
+            }
+            for p in result.ports
+        ]
         instance.status = InstanceStatus.RUNNING
         for h in result.hosts:
             session.add(

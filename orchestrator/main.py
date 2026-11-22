@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import reaper
-from .api import health, instances
+from .api import boxes, health, instances
 from .models import init_db
 
 logging.basicConfig(level=logging.INFO)
@@ -22,3 +22,4 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="ctf-orchestrator", lifespan=lifespan)
 app.include_router(health.router)
 app.include_router(instances.router)
+app.include_router(boxes.router)

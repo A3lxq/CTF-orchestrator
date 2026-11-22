@@ -10,7 +10,7 @@ from docker.errors import NotFound
 from .. import config
 from ..boxes.registry import BoxSpec, HostSpec
 from ..models import Instance
-from .base import ProvisionedHost, ProvisionResult, RuntimeBackend
+from .base import PortBinding, ProvisionedHost, ProvisionResult, RuntimeBackend
 
 # Docker API calls are blocking (the docker-py SDK is sync-only); every
 # call into the client below is wrapped in asyncio.to_thread so the async
@@ -114,6 +114,7 @@ class DockerBackend(RuntimeBackend):
         provisioned: list[ProvisionedHost] = []
         front_door_host_port: int | None = None
         front_door_all_host_ports: list[int] = []
+        entry_ports: list[PortBinding] = []
         front_door_container = None
         internal_wait_targets: list[tuple[str, int]] = []
         host_containers: dict[str, object] = {}
@@ -172,6 +173,14 @@ class DockerBackend(RuntimeBackend):
                     if bindings:
                         port_num = int(bindings[0]["HostPort"])
                         front_door_all_host_ports.append((port_num, p.container_port))
+                        entry_ports.append(
+                            PortBinding(
+                                service_name=host_spec.name,
+                                container_port=p.container_port,
+                                host_port=port_num,
+                                protocol=p.protocol,
+                            )
+                        )
                         if front_door_host_port is None:
                             front_door_host_port = port_num
             else:
@@ -241,6 +250,7 @@ class DockerBackend(RuntimeBackend):
             entry_host=config.DOCKER_HOST_PUBLIC_ADDRESS,
             entry_port=front_door_host_port,
             hosts=provisioned,
+            ports=entry_ports,
         )
 
     def _provision_nested_docker_sync(
@@ -305,12 +315,21 @@ class DockerBackend(RuntimeBackend):
         ports = container.attrs.get("NetworkSettings", {}).get("Ports") or {}
         front_door_host_port: int | None = None
         front_door_all_host_ports: list[int] = []
+        entry_ports: list[PortBinding] = []
         preferred_order = sorted(front_door.ports, key=lambda p: p.container_port != 80)
         for p in preferred_order:
             bindings = ports.get(f"{p.container_port}/{p.protocol}")
             if bindings:
                 port_num = int(bindings[0]["HostPort"])
                 front_door_all_host_ports.append(port_num)
+                entry_ports.append(
+                    PortBinding(
+                        service_name=front_door.name,
+                        container_port=p.container_port,
+                        host_port=port_num,
+                        protocol=p.protocol,
+                    )
+                )
                 if front_door_host_port is None:
                     front_door_host_port = port_num
         if front_door_host_port is None:
@@ -334,6 +353,7 @@ class DockerBackend(RuntimeBackend):
                     is_front_door=True,
                 )
             ],
+            ports=entry_ports,
         )
 
     def _wait_for_nested_dockerd(self, container, timeout_seconds: float) -> None:

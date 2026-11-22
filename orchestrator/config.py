@@ -14,6 +14,12 @@ PORT_POOL_END = int(os.environ.get("ORCHESTRATOR_PORT_POOL_END", "29999"))
 DEFAULT_TTL_MINUTES = int(os.environ.get("ORCHESTRATOR_DEFAULT_TTL_MINUTES", "120"))
 REAPER_INTERVAL_SECONDS = int(os.environ.get("ORCHESTRATOR_REAPER_INTERVAL_SECONDS", "60"))
 AUTH_BEARER_TOKEN = os.environ.get("ORCHESTRATOR_AUTH_TOKEN")  # None disables auth check (dev only)
+# Caps non-DESTROYED instances per team_id, enforced in api/instances.py's
+# create_instance (only on a genuinely NEW instance -- the idempotent
+# reattach-to-an-existing-RUNNING-instance path is never blocked by this).
+# Load-bearing now that ctf-platform's self-registration is open to anyone:
+# a single anonymous signup can otherwise request all 8 boxes with no limit.
+MAX_INSTANCES_PER_TEAM = int(os.environ.get("ORCHESTRATOR_MAX_INSTANCES_PER_TEAM", "4"))
 SPECS_DIR = os.environ.get(
     "ORCHESTRATOR_SPECS_DIR",
     os.path.join(os.path.dirname(__file__), "boxes", "specs"),
