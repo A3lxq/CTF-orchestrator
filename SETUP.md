@@ -4,11 +4,14 @@ This is the single entry point for standing up the orchestrator and all
 8 Halcyon Protocol box images from a clean checkout. If you already have
 everything built and just want the fast path, skip to **5. Verify**.
 
-This guide covers the orchestrator service and the box images only — it
-does **not** cover wiring the orchestrator into GZCTF (the separate
-.NET service that provides team management, scoring, and the
-scoreboard). That's a much larger, separate build/deploy process and
-deserves its own guide.
+**Want the whole player-facing platform running, not just this
+service?** See
+[`ctf-platform`](https://github.com/A3lxq/ctf-platform)'s own
+`SETUP.md` instead — its one-command setup (Docker or native) stands up
+*both* this orchestrator and the player/admin frontend together,
+without you needing to follow the steps below by hand. This guide is
+for standing up the orchestrator **on its own** (e.g. for development,
+or if you're building a different frontend against it).
 
 ## 0. What you're setting up
 

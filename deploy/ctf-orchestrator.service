@@ -1,0 +1,25 @@
+# Template systemd unit for running ctf-orchestrator natively (not
+# containerized) as a persistent service. See ../SETUP.md for install
+# steps. Replace <USER> and the paths below with your real values.
+#
+# Single process, no --workers: the reaper sweep loop (reaper.py) starts
+# once per process via main.py's lifespan hook. Multiple workers would
+# mean multiple independent reapers racing to destroy the same expiring
+# instances.
+[Unit]
+Description=ctf-orchestrator
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=<USER>
+Group=docker
+WorkingDirectory=/home/<USER>/ctf-orchestrator
+EnvironmentFile=/home/<USER>/ctf-orchestrator/deploy.env
+ExecStart=/home/<USER>/ctf-orchestrator/.venv/bin/uvicorn orchestrator.main:app --host 127.0.0.1 --port 9100
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
