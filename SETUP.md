@@ -224,10 +224,13 @@ ORCHESTRATOR_K8S_CONTEXT=kind-ctf-test \
 ```
 
 Then repeat the check from step 6, adding `"backend": "kubernetes"` to
-the `POST /instances` body.
-
-(Legendary does not support the Kubernetes backend — it's Docker-only,
-by design; see the memory/plan notes on why.)
+the `POST /instances` body. Legendary works here too -- its nested
+Docker daemon runs as a privileged `docker:dind` container in the
+instance's own Pod instead of a plain outer container, but needs no
+extra setup beyond what's already above (`docker:27-dind` is a public
+image the cluster pulls directly; Legendary's own 3 service images are
+preloaded straight into the nested daemon by the orchestrator itself,
+bypassing `kind load docker-image` entirely for them).
 
 ## 8. (Optional) Running the full test suites
 

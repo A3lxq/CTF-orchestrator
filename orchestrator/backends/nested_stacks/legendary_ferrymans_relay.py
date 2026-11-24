@@ -24,19 +24,33 @@ for the top-level case.
 """
 
 
-def bring_up(container, team_secret: str, images: dict[str, str]) -> None:
+def bring_up(exec_fn, team_secret: str, images: dict[str, str]) -> None:
     """images maps this box's HostSpec names ("web"/"relay"/"vault") to
     their already-preloaded image tags -- sourced from the box's own YAML
-    spec by the caller (docker_backend.py), not hardcoded here, so the
-    image name used to preload and the image name used to `docker run`
-    can never drift out of sync with each other."""
+    spec by the caller (docker_backend.py/k8s_backend.py), not hardcoded
+    here, so the image name used to preload and the image name used to
+    `docker run` can never drift out of sync with each other.
+
+    `exec_fn` runs one command inside the outer dind container/pod and
+    returns (exit_code, output_bytes) -- the same shape docker-py's own
+    `container.exec_run()` already returns. This lets the exact same
+    ordered bring-up steps below run unchanged on both backends; only
+    the transport differs (docker-py's exec_run on the Docker backend,
+    the `kubernetes` client's exec-over-websocket stream API on the
+    Kubernetes backend -- see each backend's own call site for how it
+    builds this callable). None of these commands actually need an
+    external CTF_SECRET exec-environment variable -- every nested
+    container that needs it gets it via its own `-e CTF_SECRET=...` in
+    the `docker run` argv below -- so this takes no `environment=`
+    counterpart; the Kubernetes exec API has no equivalent of one
+    anyway."""
 
     def ex(cmd: list[str]) -> None:
-        exit_code, output = container.exec_run(cmd, environment={"CTF_SECRET": team_secret})
+        exit_code, output = exec_fn(cmd)
         if exit_code != 0:
             raise RuntimeError(
                 f"legendary-ferrymans-relay nested bring-up step failed "
-                f"({cmd}): {output.decode(errors='replace')}"
+                f"({cmd}): {output.decode(errors='replace') if isinstance(output, bytes) else output}"
             )
 
     ex(["docker", "network", "create", "public-net"])

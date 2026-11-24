@@ -19,14 +19,17 @@ belongs to.
 
 ## Status: all 8 boxes done, both backends
 
-All 7 originally in-scope Halcyon Protocol boxes (Noob, Beginner,
-Intermediate, Veteran, Master, Expert, God) plus Legendary (Ferryman's
-Relay) run on the Docker backend; the first 7 also run on an optional
-Kubernetes backend (Legendary is Docker-only by design — its puzzle
-needs a disposable per-team Docker daemon, which only the Docker
-backend provides). Admins can also upload and register a custom box at
-runtime via `POST /boxes` (no restart needed) — see `ctf-platform`'s
-own admin dashboard for the UI.
+All 8 Halcyon Protocol boxes (Noob, Beginner, Intermediate, Veteran,
+Master, Expert, God, Legendary) run on **both** the Docker backend and
+an optional Kubernetes backend. Legendary's own puzzle needs a
+disposable per-team Docker daemon -- on Docker that's one outer
+container; on Kubernetes it's a privileged `docker:dind` container in
+the instance's own Pod (Pod-mates share one network namespace, so a
+nested `docker run -p` binds land on the Pod's own namespace exactly
+the way they land on the outer container's namespace on Docker). Admins
+can also upload and register a custom box at runtime via `POST /boxes`
+(no restart needed) — see `ctf-platform`'s own admin dashboard for the
+UI.
 
 Each team gets a fresh, isolated instance with real, running
 containers — proven via live checks, not mocks: cross-team network

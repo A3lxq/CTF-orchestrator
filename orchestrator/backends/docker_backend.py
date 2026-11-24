@@ -309,7 +309,7 @@ class DockerBackend(RuntimeBackend):
 
         from .nested_stacks import BRING_UPS
 
-        BRING_UPS[spec.box_id](container, team_secret, images)
+        BRING_UPS[spec.box_id](lambda cmd: container.exec_run(cmd), team_secret, images)
 
         container.reload()
         ports = container.attrs.get("NetworkSettings", {}).get("Ports") or {}

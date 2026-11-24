@@ -1,13 +1,17 @@
 import asyncio
 import contextlib
 import re
+import shlex
 import socket
+import subprocess
 import threading
 import time
 
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
 from kubernetes.client.rest import ApiException
+from kubernetes.stream import stream as k8s_stream
+from kubernetes.stream.ws_client import STDIN_CHANNEL
 
 from .. import config
 from ..boxes.registry import BoxSpec, HostSpec
@@ -88,6 +92,9 @@ class KubernetesBackend(RuntimeBackend):
         return await asyncio.to_thread(self._provision_sync, instance, spec, team_secret)
 
     def _provision_sync(self, instance: Instance, spec: BoxSpec, team_secret: str) -> ProvisionResult:
+        if spec.nested_docker:
+            return self._provision_nested_docker_sync(instance, spec, team_secret)
+
         namespace = _k8s_name("ctf", spec.box_id, str(instance.team_id))
         self._ensure_namespace(namespace)
 
@@ -184,6 +191,266 @@ class KubernetesBackend(RuntimeBackend):
         self._core.create_namespace(
             k8s_client.V1Namespace(metadata=k8s_client.V1ObjectMeta(name=namespace))
         )
+
+    # ---- nested-docker provisioning (currently: legendary-ferrymans-relay) --
+
+    def _label_namespace_privileged(self, namespace: str) -> None:
+        """Pod Security Admission (Kubernetes >=1.25) forbids a
+        privileged container by default under the usual namespace
+        levels -- this instance's own nested-Docker Pod needs one (see
+        _provision_nested_docker_sync below), so its Namespace is
+        labeled accordingly. A no-op in effect on a cluster with no PSA
+        enforcement configured (e.g. this project's own kind test
+        cluster), but correct regardless of cluster policy, so set
+        unconditionally rather than only when believed necessary."""
+        patch = {"metadata": {"labels": {"pod-security.kubernetes.io/enforce": "privileged"}}}
+        self._core.patch_namespace(namespace, patch)
+
+    def _provision_nested_docker_sync(self, instance: Instance, spec: BoxSpec, team_secret: str) -> ProvisionResult:
+        """For a box whose NestedDockerSpec is set (see registry.py) --
+        its entire stack runs inside ONE disposable nested Docker
+        daemon per instance, same design as docker_backend.py's own
+        _provision_nested_docker_sync, just ported to a Pod instead of
+        a plain container. Pod-mates share one network namespace, so a
+        nested `docker run -p` inside this Pod's one privileged dind
+        container binds that port on the *Pod's* namespace exactly the
+        way it binds on the *outer container's* own namespace on the
+        Docker backend -- confirmed empirically against this project's
+        own kind cluster (a real external client reaching the nested
+        container's port via NodePort -> node address) before writing
+        this method, not assumed. Returns exactly ONE ProvisionedHost,
+        same reasoning as the Docker backend: every real container for
+        this instance lives inside that single Pod."""
+        nd = spec.nested_docker
+        front_door = spec.front_door_host
+        namespace = _k8s_name("ctf", spec.box_id, str(instance.team_id))
+        self._ensure_namespace(namespace)
+        self._label_namespace_privileged(namespace)
+
+        used_node_ports = self._used_node_ports()
+        with self._alloc_lock:
+            # Same race-safety reasoning as the normal path's own use of
+            # this lock: refresh the snapshot now, holding the lock,
+            # right before the NodePort allocation actually commits via
+            # _create_service.
+            used_node_ports |= self._used_node_ports()
+            svc_ports, _extra_env = self._allocate_host_ports(front_door, used_node_ports)
+            self._create_nested_docker_deployment(namespace, front_door, nd, team_secret)
+            service = self._create_service(namespace, front_door, svc_ports)
+
+        pod_name = self._wait_for_pod_ready(namespace, front_door.name)
+        self._wait_for_nested_dockerd_k8s(namespace, pod_name, nd.dockerd_ready_timeout_seconds)
+
+        images = {h.name: h.image for h in spec.hosts if h.nested_docker}
+        self._preload_nested_images_k8s(namespace, pod_name, list(images.values()) + nd.extra_preload_images)
+
+        from .nested_stacks import BRING_UPS
+
+        BRING_UPS[spec.box_id](lambda cmd: self._k8s_exec(namespace, pod_name, "dind", cmd), team_secret, images)
+
+        front_door_port: int | None = None
+        entry_ports: list[PortBinding] = []
+        preferred = sorted(front_door.ports, key=lambda p: p.container_port != 80)
+        front_container_port = preferred[0].container_port
+        for p in service.spec.ports:
+            if p.port == front_container_port:
+                front_door_port = p.node_port
+            entry_ports.append(
+                PortBinding(
+                    service_name=front_door.name,
+                    container_port=p.port,
+                    host_port=p.node_port,
+                    protocol=(p.protocol or "TCP").lower(),
+                )
+            )
+        if front_door_port is None:
+            raise RuntimeError("nested-docker front-door host did not come up with an expected NodePort")
+
+        entry_host = self._node_public_address()
+        # Same readiness probe every other front door on this backend
+        # uses, unchanged -- the NodePort is a real bound port on this
+        # real cluster regardless of what's nested behind it.
+        self._wait_for_service(entry_host, front_door_port)
+
+        return ProvisionResult(
+            network_name=namespace,
+            entry_host=entry_host,
+            entry_port=front_door_port,
+            hosts=[
+                ProvisionedHost(
+                    service_name=front_door.name, container_ref=pod_name, internal_ip=None, is_front_door=True
+                )
+            ],
+            ports=entry_ports,
+        )
+
+    def _create_nested_docker_deployment(self, namespace: str, front_door: HostSpec, nd, team_secret: str) -> None:
+        labels = {"app": front_door.name}
+        container = k8s_client.V1Container(
+            name="dind",
+            image=nd.outer_image,
+            image_pull_policy="IfNotPresent",
+            security_context=k8s_client.V1SecurityContext(privileged=nd.privileged),
+            env=[k8s_client.V1EnvVar(name="CTF_SECRET", value=team_secret)],
+            ports=[k8s_client.V1ContainerPort(container_port=p.container_port) for p in front_door.ports],
+            volume_mounts=[k8s_client.V1VolumeMount(name="docker-data", mount_path="/var/lib/docker")],
+        )
+        template = k8s_client.V1PodTemplateSpec(
+            metadata=k8s_client.V1ObjectMeta(labels=labels),
+            spec=k8s_client.V1PodSpec(
+                containers=[container],
+                volumes=[k8s_client.V1Volume(name="docker-data", empty_dir=k8s_client.V1EmptyDirVolumeSource())],
+                restart_policy="Always",
+            ),
+        )
+        deployment = k8s_client.V1Deployment(
+            metadata=k8s_client.V1ObjectMeta(name=front_door.name, namespace=namespace, labels=labels),
+            spec=k8s_client.V1DeploymentSpec(
+                replicas=1,
+                selector=k8s_client.V1LabelSelector(match_labels={"app": front_door.name}),
+                template=template,
+                # Deliberately no min_ready_seconds/readinessProbe gate
+                # here, unlike every other host's Deployment -- this
+                # container's own process being up says nothing about
+                # whether the box is actually playable yet (nothing is
+                # nested inside it at this point). Readiness is instead
+                # this whole method's own explicit wait sequence below
+                # (dockerd up -> images preloaded -> bring_up() -> the
+                # real front-door port answering), mirroring the Docker
+                # backend's analogous nested path exactly.
+            ),
+        )
+        self._apps.create_namespaced_deployment(namespace, deployment)
+
+    def _wait_for_pod_ready(self, namespace: str, app_label: str, timeout_seconds: float = 60.0) -> str:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            pods = self._core.list_namespaced_pod(namespace, label_selector=f"app={app_label}").items
+            for pod in pods:
+                if pod.status.phase == "Running":
+                    conds = {c.type: c.status for c in (pod.status.conditions or [])}
+                    if conds.get("Ready") == "True":
+                        return pod.metadata.name
+            time.sleep(1)
+        raise RuntimeError(f"no Ready pod with label app={app_label} in {namespace} within {timeout_seconds}s")
+
+    def _k8s_exec(self, namespace: str, pod: str, container: str, cmd: list[str]) -> tuple[int, bytes]:
+        """Non-interactive exec (no stdin) -- returns (exit_code,
+        output_bytes), the same shape docker-py's own
+        container.exec_run() returns, so nested_stacks' bring_up() can
+        treat both backends identically via an injected callable.
+
+        Deliberately does NOT use the kubernetes client's own
+        `WSClient.returncode` (the exec protocol's dedicated status/
+        error channel) -- confirmed by direct testing against this
+        project's own kind cluster that it comes back empty even for a
+        command that plainly succeeded (`ws._channels` empty, `.returncode`
+        raising `TypeError: 'NoneType' object is not subscriptable`),
+        not merely a timing fluke. Wrapping the command in a shell that
+        echoes its own `$?` after an unambiguous marker string, then
+        parsing that back out of stdout, sidesteps the unreliable
+        channel entirely."""
+        marker = "__ORCHESTRATOR_EXIT_CODE__"
+        shell_cmd = ["sh", "-c", f"{shlex.join(cmd)}; echo {marker}$?"]
+        ws = k8s_stream(
+            self._core.connect_get_namespaced_pod_exec,
+            pod,
+            namespace,
+            container=container,
+            command=shell_cmd,
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+            _preload_content=False,
+        )
+        ws.run_forever(timeout=120)
+        output = ws.read_all()
+        ws.close()
+        body, sep, code_part = output.rpartition(marker)
+        if not sep:
+            raise RuntimeError(f"exec session produced no exit marker (cmd={cmd!r}): {output!r}")
+        exit_code = int(code_part.strip().splitlines()[0])
+        return exit_code, body.encode() if isinstance(body, str) else body
+
+    def _wait_for_nested_dockerd_k8s(self, namespace: str, pod: str, timeout_seconds: float) -> None:
+        """Cold nested-dockerd init through a Pod is one layer deeper
+        than the Docker backend's own two-layer nesting (host -> kind
+        node -> Pod's dind, when tested on kind) -- its own longer
+        timeout, same reasoning as docker_backend.py's analogous wait."""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            exit_code, _ = self._k8s_exec(namespace, pod, "dind", ["docker", "info"])
+            if exit_code == 0:
+                return
+            time.sleep(1)
+        raise RuntimeError(f"nested dockerd in {namespace}/{pod} never became ready within {timeout_seconds}s")
+
+    def _preload_nested_images_k8s(self, namespace: str, pod: str, images: list[str]) -> None:
+        """Kubernetes has no `docker exec -i | docker load` pipe
+        equivalent as a simple shell pipeline the way the Docker
+        backend uses -- streams `docker save`'s output (still run as a
+        local subprocess on the orchestrator host, same as the Docker
+        backend) into a `docker load` exec session's stdin over the
+        kubernetes client's websocket exec API, closing just the stdin
+        channel to signal EOF once every byte is sent. Confirmed via a
+        manual spike against this project's own kind cluster that a
+        client-side stdin-channel close genuinely makes the remote
+        `docker load` process see real EOF and exit (not merely a
+        client-side no-op) before trusting this in the real
+        implementation."""
+        marker = "__ORCHESTRATOR_EXIT_CODE__"
+        for image in images:
+            tar_bytes = subprocess.run(["docker", "save", image], capture_output=True, check=True).stdout
+            ws = k8s_stream(
+                self._core.connect_get_namespaced_pod_exec,
+                pod,
+                namespace,
+                container="dind",
+                # Same marker-based exit-code trick as _k8s_exec, and for
+                # the same reason (the exec protocol's own status channel
+                # came back empty even on success when tested directly) --
+                # `docker load` still reads this shell's inherited stdin
+                # same as it would un-wrapped, since it's the first
+                # command in the sequence.
+                command=["sh", "-c", f"docker load; echo {marker}$?"],
+                stderr=True,
+                stdin=True,
+                stdout=True,
+                tty=False,
+                _preload_content=False,
+            )
+            chunk_size = 1024 * 1024
+            offset = 0
+            sent_eof = False
+            while ws.is_open():
+                # Non-blocking while there's still data to push -- a
+                # blocking `update(timeout=1)` on every iteration (the
+                # obvious-looking version) self-throttles this entire
+                # loop to roughly one chunk per second regardless of
+                # chunk size, since there's nothing to *read* yet this
+                # early and update() blocks up to its timeout waiting
+                # for inbound frames anyway. Confirmed directly: that
+                # version took >90s to push under 6MB of a 45MB image;
+                # this version pushes the same 45MB in ~1.5s. Only wait
+                # once every byte is already sent and there's nothing
+                # left to do but watch for the remote side to finish.
+                ws.update(timeout=0 if offset < len(tar_bytes) else 1)
+                if offset < len(tar_bytes):
+                    chunk = tar_bytes[offset : offset + chunk_size]
+                    ws.write_stdin(chunk)
+                    offset += len(chunk)
+                elif not sent_eof:
+                    ws.close_channel(STDIN_CHANNEL)
+                    sent_eof = True
+            output = ws.read_all()
+            ws.close()
+            body, sep, code_part = output.rpartition(marker)
+            if not sep:
+                raise RuntimeError(f"preloading {image} into nested dockerd ({namespace}/{pod}): no exit marker: {output!r}")
+            exit_code = int(code_part.strip().splitlines()[0])
+            if exit_code != 0:
+                raise RuntimeError(f"preloading {image} into nested dockerd ({namespace}/{pod}) failed: {body}")
 
     def _used_node_ports(self) -> set[int]:
         used: set[int] = set()
