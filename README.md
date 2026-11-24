@@ -1,13 +1,13 @@
 # ctf-orchestrator
 
-Per-team container orchestration for The Halcyon Protocol CTF boxes,
-built to sit behind a modified GZCTF (team management, scoring,
-scoreboard, admin UI) without touching GZCTF's own Restricted-licensed
-container-provisioning code. See
-`/home/immanuvel/.claude/plans/sparkling-roaming-sedgewick.md` for the
-full design and rationale (why this exists as a separate service, the
-GZCTF licensing constraint, the per-box resurrection plan, build
-sequence).
+Per-team container orchestration for The Halcyon Protocol CTF boxes.
+Given a `box_id` and a per-team secret, it provisions an isolated
+instance of that box and returns where to reach it — the backend for
+[`ctf-platform`](https://github.com/A3lxq/ctf-platform), the player-
+and admin-facing frontend (teams, games, challenges, scoring,
+scoreboard), which talks to this service only over plain HTTP. See
+that repo's own `SETUP.md` for the fastest way to stand up both
+together with one command.
 
 Each team gets their own fresh container instance of a chosen box, with
 a per-team secret injected as `CTF_SECRET` — the box derives all 10 of
@@ -24,8 +24,9 @@ Intermediate, Veteran, Master, Expert, God) plus Legendary (Ferryman's
 Relay) run on the Docker backend; the first 7 also run on an optional
 Kubernetes backend (Legendary is Docker-only by design — its puzzle
 needs a disposable per-team Docker daemon, which only the Docker
-backend provides). Not yet wired to a real GZCTF deployment — that's a
-separate, larger integration layer, not covered here.
+backend provides). Admins can also upload and register a custom box at
+runtime via `POST /boxes` (no restart needed) — see `ctf-platform`'s
+own admin dashboard for the UI.
 
 Each team gets a fresh, isolated instance with real, running
 containers — proven via live checks, not mocks: cross-team network
