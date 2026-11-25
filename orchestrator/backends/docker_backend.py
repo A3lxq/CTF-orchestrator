@@ -445,9 +445,26 @@ class DockerBackend(RuntimeBackend):
         this guards against): this requires an actual response from the
         listener behind the connection -- either a server-first banner
         (SSH/FTP send one unprompted) or, if nothing arrives unprompted,
-        a reply to a generic HTTP GET. A reset while waiting for either,
-        or no response from either probe, means this attempt was not
-        ready (caller retries)."""
+        a reply to a generic HTTP GET. A reset at any point (Docker's
+        userland-proxy accepting the handshake before a real backend
+        exists, then resetting once it tries and fails to forward data)
+        means this attempt was not ready; this is the one failure mode
+        the whole dance exists to catch, and it always surfaces as an
+        OSError (ConnectionResetError), never a timeout.
+
+        A THIRD case, found building domainzero-noob-reception (the
+        project's first box to publish raw SMB as a front-door port):
+        some real protocols neither send a banner NOR respond to a
+        generic HTTP GET at all -- smbd silently ignores unrecognized
+        bytes and, confirmed by direct reproduction, leaves the
+        connection open rather than closing or resetting it. A second
+        timeout (not a reset) after genuinely sending data down an
+        already-connected socket is itself proof a real listener
+        accepted the connection and is deliberately waiting for
+        well-formed input -- exactly the condition this probe exists to
+        confirm -- so it counts as ready too, distinct from the
+        immediate close/reset the userland-proxy-with-no-backend case
+        always produces."""
         try:
             with socket.create_connection((host, port), timeout=1.0) as s:
                 s.settimeout(1.0)
@@ -460,8 +477,11 @@ class DockerBackend(RuntimeBackend):
                     pass  # no server-first banner -- try an HTTP probe below
 
                 s.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
-                data = s.recv(16)
-                return bool(data)
+                try:
+                    data = s.recv(16)
+                    return bool(data)
+                except TimeoutError:
+                    return True  # silent protocol, connection still open -- a real listener
         except OSError:
             return False
 

@@ -1,0 +1,8 @@
+box_id: cloudbreak-noob-bucket
+hosts:
+  - name: storage-server
+    image: ctf-boxes/cloudbreak-noob-bucket:latest
+    front_door: true
+    ports:
+      - {container_port: 22}
+      - {container_port: 9000}

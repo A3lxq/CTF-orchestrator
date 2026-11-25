@@ -1,0 +1,11 @@
+<!-- helpdesk-tooling-config.xml -- last known-good backup before migration -->
+<!-- FLAG4_PLACEHOLDER -->
+<config>
+  <service name="svc_helpdesk">
+    <account>svc_helpdesk</account>
+    <!-- TODO: rotate before go-live. Nobody ever did. -->
+    <password>Reception2024!</password>
+    <notes>Also used for the helpdesk mailbox and, against policy,
+    the account's own interactive login on the file server itself.</notes>
+  </service>
+</config>

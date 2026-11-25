@@ -1,0 +1,9 @@
+Internal memo -- Ops team only
+===============================
+If you can read this, you've authenticated as svc_helpdesk. Good.
+
+Restricted flag: FLAG5_PLACEHOLDER
+
+Reminder: svc_helpdesk's password also works over SSH on this same
+server (port 22) -- same account, same bad habit of reusing it
+everywhere. Use it to get an actual shell if you need one.

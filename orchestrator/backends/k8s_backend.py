@@ -772,9 +772,11 @@ class KubernetesBackend(RuntimeBackend):
     def _wait_for_service(self, host: str, port: int, timeout_seconds: float = 90.0) -> None:
         """Same protocol-agnostic probe as DockerBackend's
         _wait_for_service (see its own docstring for the full
-        rationale) -- reused here verbatim since NodePort's readiness
-        race is the same class of problem, just a different proxy
-        layer (kube-proxy instead of Docker's userland-proxy)."""
+        rationale, including the silent-protocol case found building
+        domainzero-noob-reception's SMB front door) -- reused here
+        verbatim since NodePort's readiness race is the same class of
+        problem, just a different proxy layer (kube-proxy instead of
+        Docker's userland-proxy)."""
         deadline = time.monotonic() + timeout_seconds
         last_error: Exception | None = None
         while time.monotonic() < deadline:
@@ -792,10 +794,13 @@ class KubernetesBackend(RuntimeBackend):
                         pass
 
                     s.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
-                    data = s.recv(16)
-                    if data:
-                        return
-                    last_error = RuntimeError("connection accepted but no response to probe")
+                    try:
+                        data = s.recv(16)
+                        if data:
+                            return
+                        last_error = RuntimeError("connection accepted but no response to probe")
+                    except TimeoutError:
+                        return  # silent protocol, connection still open -- a real listener
             except OSError as e:
                 last_error = e
             time.sleep(0.5)

@@ -1,0 +1,16 @@
+MERIDIAN SYSTEMS -- Staff Directory (uncontrolled copy)
+========================================================
+Name                Username
+--------------------------------------------------------
+Jordan Alvarez       j.alvarez
+Priya Natarajan      p.natarajan
+Marcus Webb          m.webb
+Helpdesk (shared)    svc_helpdesk
+Dana Kowalski        d.kowalski
+IT Operations        svc_ops
+
+Directory flag: FLAG2_PLACEHOLDER
+
+Note from IT: config backups are kept on the "ops-archive" share, not
+on this one. It's not listed when you browse the server -- connect to
+it directly by name.

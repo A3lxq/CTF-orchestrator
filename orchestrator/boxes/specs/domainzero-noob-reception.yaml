@@ -1,0 +1,16 @@
+box_id: domainzero-noob-reception
+hosts:
+  - name: reception-server
+    image: ctf-boxes/domainzero-noob-reception:latest
+    front_door: true
+    ports:
+      # 22 listed first so it becomes the displayed "entry_port" (the
+      # preferred_order sort in docker_backend.py only affects which
+      # port is picked for that display field, not probe order --
+      # every front-door port is readiness-probed regardless of this
+      # list's order). SMB's own probe gap (silent protocol, no banner,
+      # no response to a generic GET) was a real bug in the probe
+      # itself, fixed in docker_backend.py/k8s_backend.py directly.
+      - {container_port: 22}
+      - {container_port: 445}
+      - {container_port: 139}
