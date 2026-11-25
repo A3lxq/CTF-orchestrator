@@ -102,6 +102,7 @@ class KubernetesBackend(RuntimeBackend):
         provisioned: list[ProvisionedHost] = []
         front_door_port: int | None = None
         entry_ports: list[PortBinding] = []
+        pasv_actual_range: tuple[int, int] | None = None
 
         for host_spec in spec.hosts:
             # Only a front-door host actually allocates a NodePort from
@@ -117,6 +118,17 @@ class KubernetesBackend(RuntimeBackend):
                 svc_ports, node_port_env = self._allocate_host_ports(host_spec, used_node_ports)
                 self._create_deployment(namespace, host_spec, team_secret, instance, node_port_env)
                 service = self._create_service(namespace, host_spec, svc_ports)
+
+            if host_spec.front_door and host_spec.pasv_range:
+                # The NetworkPolicy needs the REAL allocated NodePort
+                # range, not the spec's container_min/container_max --
+                # those numbers are never actually bound on this backend
+                # (see _allocate_host_ports' own note: container port N
+                # here is forced to equal NodePort N for every N in the
+                # dynamically-allocated range).
+                pasv_ports = [p.node_port for p in svc_ports if p.name.startswith("pasv")]
+                if pasv_ports:
+                    pasv_actual_range = (min(pasv_ports), max(pasv_ports))
 
             if host_spec.front_door:
                 # Prefer port 80 as "the" single entry port when present,
@@ -151,7 +163,7 @@ class KubernetesBackend(RuntimeBackend):
                 )
             )
 
-        self._apply_network_policies(namespace, spec)
+        self._apply_network_policies(namespace, spec, pasv_actual_range)
 
         # Wait for every Deployment's pod(s) to actually be Ready -- unlike
         # the Docker backend, the k8s API gives us real readiness signal
@@ -642,7 +654,9 @@ class KubernetesBackend(RuntimeBackend):
         )
         return self._core.create_namespaced_service(namespace, service)
 
-    def _apply_network_policies(self, namespace: str, spec: BoxSpec) -> None:
+    def _apply_network_policies(
+        self, namespace: str, spec: BoxSpec, pasv_actual_range: tuple[int, int] | None = None
+    ) -> None:
         front_door = spec.front_door_host
         # k8s has no separate network-topology layer the way Docker has
         # separate bridge networks -- every pod in a namespace already
@@ -690,6 +704,30 @@ class KubernetesBackend(RuntimeBackend):
         # the Service above sets external_traffic_policy=Local, which
         # keeps the real client IP instead of letting kube-proxy SNAT it
         # to something that could land back inside the excluded range.
+        allowed_ports = [
+            k8s_client.V1NetworkPolicyPort(protocol=p.protocol.upper(), port=p.container_port)
+            for p in front_door.ports
+        ]
+        if pasv_actual_range:
+            # The box's declared front-door ports alone miss the passive
+            # FTP data-channel range entirely -- confirmed by a real failed
+            # connection (TimeoutError, i.e. silently dropped, not
+            # connection-refused) during this box's own test suite: a
+            # client reaching the control port fine but timing out on the
+            # announced PASV data port, because nothing above ever opened
+            # ingress to it. Uses the REAL allocated NodePort range (passed
+            # in by the caller), not the spec's container_min/
+            # container_max -- those are never actually bound on this
+            # backend. `end_port` (stable since Kubernetes 1.25) expresses
+            # the whole range as one rule instead of enumerating every
+            # port in it.
+            allowed_ports.append(
+                k8s_client.V1NetworkPolicyPort(
+                    protocol="TCP",
+                    port=pasv_actual_range[0],
+                    end_port=pasv_actual_range[1],
+                )
+            )
         allow_external = k8s_client.V1NetworkPolicy(
             metadata=k8s_client.V1ObjectMeta(name="allow-front-door-external", namespace=namespace),
             spec=k8s_client.V1NetworkPolicySpec(
@@ -700,10 +738,7 @@ class KubernetesBackend(RuntimeBackend):
                         _from=[
                             k8s_client.V1NetworkPolicyPeer(ip_block=_pod_cidr_exclusion_block())
                         ],
-                        ports=[
-                            k8s_client.V1NetworkPolicyPort(protocol=p.protocol.upper(), port=p.container_port)
-                            for p in front_door.ports
-                        ]
+                        ports=allowed_ports,
                     )
                 ],
             ),
