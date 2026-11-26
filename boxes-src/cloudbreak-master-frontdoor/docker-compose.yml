@@ -8,6 +8,7 @@ services:
       - CTF_SECRET=${CTF_SECRET}
     ports:
       - "8080:80"
+      - "2222:2222"
     networks:
       - public-net
       - internal-net

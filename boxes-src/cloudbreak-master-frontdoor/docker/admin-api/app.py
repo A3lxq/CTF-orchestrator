@@ -100,6 +100,7 @@ class AdminAPIHandler(http.server.BaseHTTPRequestHandler):
             payload = {
                 "flag": flag(5),
                 "note": "internal only -- never expose this past the edge proxy",
+                "ssh_hint": "this host's sshd is only reachable through frontproxy's relay -- ssh -p 2222 ops@<frontproxy>",
                 "users": [
                     {"username": "ops", "role": "linux-shell", "ssh_password": OPS_SSH_PASSWORD},
                     {"username": "svc", "role": "service-account (no shell)"},

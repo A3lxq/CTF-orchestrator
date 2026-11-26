@@ -5,6 +5,11 @@ hosts:
     front_door: true
     ports:
       - {container_port: 80}
+      # Blind TCP relay to admin-api:22 (see docker/frontproxy/app.py) --
+      # this box's one and only front door also doubles as the bastion
+      # for the SSH foothold, since admin-api never gets a published
+      # port of its own.
+      - {container_port: 2222}
   - name: admin-api
     image: ctf-boxes/cloudbreak-master-frontdoor-admin-api:latest
     front_door: false

@@ -31,6 +31,16 @@ SECOND response behind the first one. This proxy's "read exactly one
 response, then move on" logic has no idea that happened -- the next
 thing it forwards will get that stale, smuggled response handed back
 instead of its own. That's the desync.
+
+This host is the box's ONLY published front door -- admin-api never
+gets a published port of its own on purpose. So frontproxy also runs a
+second, completely separate listener on port 2222: a dumb, blind
+bidirectional TCP relay/passthrough to admin-api:22, no protocol
+awareness at all (same spirit as a bastion host forwarding SSH to an
+internal box). This is what makes the SSH foothold (once a player has
+stolen the ops credential via the smuggling chain above) actually
+reachable by a real external player hitting only this box's published
+ports -- not a shortcut, just the standard jump-host pattern.
 """
 import os
 import socket
@@ -44,6 +54,13 @@ SECRET = os.environ["CTF_SECRET"]
 LISTEN_PORT = 80
 BACKEND_HOST = "admin-api"
 BACKEND_PORT = 8000
+
+# Blind SSH relay -- published alongside port 80 so a real external
+# player can actually reach admin-api's sshd, the same way a bastion
+# host forwards SSH to an internal box. See module docstring.
+RELAY_LISTEN_PORT = 2222
+RELAY_BACKEND_HOST = "admin-api"
+RELAY_BACKEND_PORT = 22
 
 # One single persistent connection to the backend, reused by every
 # request this proxy ever forwards -- never one-connection-per-request.
@@ -138,6 +155,9 @@ def _serve_local(path: str) -> bytes:
     outside this gateway.</li>
 <li>2026-01-18: split the monolith -- admin tooling now lives on its own
     internal host, "admin-api", behind this proxy.</li>
+<li>2026-01-05: this gateway now also relays SSH on :2222 through to the
+    ops host for anyone with a valid credential -- same box, same
+    front door, two different protocols.</li>
 </ul>
 </body></html>""".encode()
     return _http_response("200 OK", "text/html", body)
@@ -208,7 +228,62 @@ def handle_client(conn):
             pass
 
 
+def _relay_pump(src: socket.socket, dst: socket.socket):
+    """Blindly shovels bytes from src to dst until src closes/errors --
+    no protocol awareness, just a TCP splice. Half-closes dst's write
+    side afterward so the other pump (running the opposite direction on
+    another thread) still gets to finish draining its own side."""
+    try:
+        while True:
+            data = src.recv(4096)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def handle_relay_client(client_conn: socket.socket):
+    try:
+        backend_conn = socket.create_connection((RELAY_BACKEND_HOST, RELAY_BACKEND_PORT))
+    except OSError:
+        try:
+            client_conn.close()
+        except OSError:
+            pass
+        return
+    t1 = threading.Thread(target=_relay_pump, args=(client_conn, backend_conn), daemon=True)
+    t2 = threading.Thread(target=_relay_pump, args=(backend_conn, client_conn), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    for s in (client_conn, backend_conn):
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def relay_server():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", RELAY_LISTEN_PORT))
+    srv.listen(128)
+    print(f"[frontproxy] ssh relay listening on :{RELAY_LISTEN_PORT} -> {RELAY_BACKEND_HOST}:{RELAY_BACKEND_PORT}", flush=True)
+    while True:
+        conn, _addr = srv.accept()
+        threading.Thread(target=handle_relay_client, args=(conn,), daemon=True).start()
+
+
 def main():
+    threading.Thread(target=relay_server, daemon=True).start()
+
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", LISTEN_PORT))
