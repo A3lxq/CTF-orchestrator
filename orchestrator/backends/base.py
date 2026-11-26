@@ -48,3 +48,23 @@ class RuntimeBackend(ABC):
 
     @abstractmethod
     async def destroy(self, instance: Instance) -> None: ...
+
+    @abstractmethod
+    async def cleanup_failed_provision(self, instance: Instance, spec: BoxSpec) -> None:
+        """Best-effort teardown after `provision()` raises partway
+        through. Deliberately does NOT reuse `destroy()`'s own logic,
+        which keys off `instance.network_name`/`instance.hosts` --
+        neither is populated yet at the point a provisioning attempt
+        can fail (the API layer only fills them in on SUCCESS, see
+        api/instances.py's create_instance), so a naive `destroy()`
+        call here would silently no-op and leave whatever real
+        containers/namespaces/networks the failed attempt already
+        created running forever. Found as a real bug: three full
+        domainzero-intermediate-domainedge instances (a real Samba AD
+        DC each) were left running indefinitely after repeated
+        provisioning failures during this box's own test suite,
+        compounding host CPU contention into every subsequent attempt.
+        Re-derives the exact same deterministic names `provision()`
+        itself uses (box_id + team_id + host name) instead, so this
+        works regardless of how far provisioning actually got."""
+        ...

@@ -97,6 +97,16 @@ class KubernetesBackend(RuntimeBackend):
 
         namespace = _k8s_name("ctf", spec.box_id, str(instance.team_id))
         self._ensure_namespace(namespace)
+        if any(h.extra_capabilities for h in spec.hosts):
+            # Pod Security Admission's "baseline"/"restricted" levels
+            # (common cluster defaults) only allow adding back a small
+            # fixed capability set (NET_BIND_SERVICE under "restricted",
+            # a slightly larger fixed list under "baseline") -- neither
+            # permits an arbitrary capability like SYS_ADMIN, the same
+            # reasoning nested_docker's privileged mode already needed
+            # this label for. A no-op on a cluster that doesn't enforce
+            # PSA at all (this project's own kind cluster included).
+            self._label_namespace_privileged(namespace)
 
         used_node_ports = self._used_node_ports()
         provisioned: list[ProvisionedHost] = []
@@ -182,8 +192,14 @@ class KubernetesBackend(RuntimeBackend):
         # same class of race as Docker's userland-proxy accept-then-reset
         # (see docker_backend.py), different mechanism, same symptom.
         # Confirm the published port is actually answering before
-        # reporting the instance ready.
-        self._wait_for_service(entry_host, front_door_port)
+        # reporting the instance ready. This backend's own default (90s)
+        # is already generous enough for domainzero-intermediate-
+        # domainedge's real boot sequence, unlike docker_backend.py's
+        # tighter 30s default -- still threading HostSpec's own override
+        # through here too, for consistency and so this doesn't silently
+        # diverge from the Docker backend's behavior for some other,
+        # even-slower future box.
+        self._wait_for_service(entry_host, front_door_port, spec.front_door_host.readiness_timeout_seconds)
 
         return ProvisionResult(
             network_name=namespace,
@@ -604,6 +620,13 @@ class KubernetesBackend(RuntimeBackend):
             env=env_list,
             ports=[k8s_client.V1ContainerPort(container_port=p.container_port) for p in host_spec.ports],
             readiness_probe=readiness_probe,
+            security_context=(
+                k8s_client.V1SecurityContext(
+                    capabilities=k8s_client.V1Capabilities(add=host_spec.extra_capabilities)
+                )
+                if host_spec.extra_capabilities
+                else None
+            ),
         )
         template = k8s_client.V1PodTemplateSpec(
             metadata=k8s_client.V1ObjectMeta(labels=labels),
@@ -795,10 +818,17 @@ class KubernetesBackend(RuntimeBackend):
 
                     s.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
                     try:
-                        data = s.recv(16)
-                        if data:
-                            return
-                        last_error = RuntimeError("connection accepted but no response to probe")
+                        s.recv(16)
+                        # A real TLS listener (LDAPS/636, GC-SSL/3269 --
+                        # found building domainzero-intermediate-domainedge)
+                        # handed this plaintext GET as a bogus TLS record
+                        # closes gracefully (empty read, no exception), not
+                        # with a reset or a hang. Per this probe's own
+                        # design, a reset is the only "not ready" signal
+                        # (it always surfaces as OSError, below) -- so any
+                        # outcome here that didn't raise, even an empty
+                        # read, means a real listener processed it.
+                        return
                     except TimeoutError:
                         return  # silent protocol, connection still open -- a real listener
             except OSError as e:
@@ -878,3 +908,22 @@ class KubernetesBackend(RuntimeBackend):
                 raise
             time.sleep(1)
         raise RuntimeError(f"namespace {instance.network_name} did not finish terminating within {timeout_seconds}s")
+
+    async def cleanup_failed_provision(self, instance: Instance, spec: BoxSpec) -> None:
+        await asyncio.to_thread(self._cleanup_failed_provision_sync, instance, spec)
+
+    def _cleanup_failed_provision_sync(self, instance: Instance, spec: BoxSpec) -> None:
+        # Same reasoning as DockerBackend's own cleanup_failed_provision:
+        # instance.network_name isn't populated yet at the point a
+        # provisioning attempt can fail (see api/instances.py's
+        # create_instance), so re-derive the exact same deterministic
+        # namespace name _provision_sync itself uses, rather than relying
+        # on it. Fire-and-forget delete (no wait-for-terminated loop, this
+        # is a best-effort cleanup on an already-failed request, not
+        # worth blocking the API response further).
+        namespace = _k8s_name("ctf", spec.box_id, str(instance.team_id))
+        try:
+            self._core.delete_namespace(namespace)
+        except ApiException as e:
+            if e.status != 404:
+                raise

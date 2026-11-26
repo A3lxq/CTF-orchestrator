@@ -123,6 +123,10 @@ async def create_instance(req: CreateInstanceRequest):
         except Exception as e:
             instance.status = InstanceStatus.ERROR
             session.commit()
+            try:
+                await backend.cleanup_failed_provision(instance, spec)
+            except Exception:
+                pass  # best-effort; don't mask the original provisioning error
             raise HTTPException(status_code=500, detail=f"provisioning failed: {e}") from e
 
         instance.network_name = result.network_name

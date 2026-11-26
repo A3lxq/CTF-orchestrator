@@ -209,7 +209,9 @@ class DockerBackend(RuntimeBackend):
         # reset. Probe every port the same, protocol-agnostic way instead
         # of special-casing port 80.
         for port_num, _container_port in front_door_all_host_ports:
-            self._wait_for_service(config.DOCKER_HOST_PUBLIC_ADDRESS, port_num)
+            self._wait_for_service(
+                config.DOCKER_HOST_PUBLIC_ADDRESS, port_num, spec.front_door_host.readiness_timeout_seconds
+            )
 
         # Internal-only hosts (Master's backoffice, Expert's
         # directory/fileserver, God's waystation/vault, ...) have no
@@ -464,7 +466,24 @@ class DockerBackend(RuntimeBackend):
         well-formed input -- exactly the condition this probe exists to
         confirm -- so it counts as ready too, distinct from the
         immediate close/reset the userland-proxy-with-no-backend case
-        always produces."""
+        always produces.
+
+        A FOURTH case, found building domainzero-intermediate-domainedge
+        (the project's first box to publish a raw TLS port -- LDAPS/636,
+        Global Catalog SSL/3269 -- as a front door): a real TLS listener
+        handed this probe's plaintext HTTP GET bytes (not a valid TLS
+        record) responds by closing the connection gracefully -- a clean
+        EOF (`recv` returns b''), not a timeout and, confirmed by direct
+        reproduction, not a reset either. The old code treated that empty
+        read as "not ready" and retried forever, timing out the whole
+        provisioning attempt even though the real service was already up
+        from the first few seconds. Per this function's own documented
+        reasoning above, a RESET is the only signal that actually means
+        "not ready yet" (Docker's userland-proxy-with-no-backend case) --
+        it always surfaces as OSError, caught below. Once the GET has
+        been sent without raising, any outcome (real data, a timeout, or
+        a graceful close) means a real listener accepted and processed
+        the connection, so all three now count as ready."""
         try:
             with socket.create_connection((host, port), timeout=1.0) as s:
                 s.settimeout(1.0)
@@ -478,8 +497,8 @@ class DockerBackend(RuntimeBackend):
 
                 s.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
                 try:
-                    data = s.recv(16)
-                    return bool(data)
+                    s.recv(16)
+                    return True  # got a response, even an empty/closed one -- not a reset
                 except TimeoutError:
                     return True  # silent protocol, connection still open -- a real listener
         except OSError:
@@ -608,6 +627,7 @@ exit 1
                 ports=ports if host_spec.front_door else None,
                 network=primary_network.name,
                 detach=True,
+                cap_add=host_spec.extra_capabilities or None,
             )
             # Several multi-host boxes' own intended solve path has the
             # player, after pivoting in via the front door, type the box's
@@ -702,6 +722,39 @@ exit 1
         # every internal network this instance ever created, old-style
         # (one, unsuffixed) or segmented (several, suffixed) alike.
         prefix = f"{instance.network_name}-internal"
+        for net in self._client.networks.list():
+            if net.name == prefix or net.name.startswith(f"{prefix}-"):
+                try:
+                    net.remove()
+                except docker.errors.APIError:
+                    pass
+
+    async def cleanup_failed_provision(self, instance: Instance, spec: BoxSpec) -> None:
+        await asyncio.to_thread(self._cleanup_failed_provision_sync, instance, spec)
+
+    def _cleanup_failed_provision_sync(self, instance: Instance, spec: BoxSpec) -> None:
+        network_name = f"ctf-{instance.box_id}-{instance.team_id}"
+
+        if spec.nested_docker:
+            container_names = [f"ctf-{instance.box_id}-{instance.team_id}-outer"[:63]]
+        else:
+            container_names = [
+                f"ctf-{instance.box_id}-{instance.team_id}-{h.name}"[:63] for h in spec.hosts
+            ]
+        for name in container_names:
+            try:
+                self._client.containers.get(name).remove(force=True)
+            except NotFound:
+                pass
+
+        try:
+            self._client.networks.get(network_name).remove()
+        except NotFound:
+            pass
+        except docker.errors.APIError:
+            pass
+
+        prefix = f"{network_name}-internal"
         for net in self._client.networks.list():
             if net.name == prefix or net.name.startswith(f"{prefix}-"):
                 try:
