@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 orchestrator.db
 .pytest_cache/
+.claude/worktrees/
