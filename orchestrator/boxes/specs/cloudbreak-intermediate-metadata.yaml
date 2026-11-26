@@ -1,0 +1,12 @@
+box_id: cloudbreak-intermediate-metadata
+hosts:
+  - name: portal
+    image: ctf-boxes/cloudbreak-intermediate-metadata:latest
+    front_door: true
+    # NET_ADMIN: entrypoint.sh adds 169.254.169.254 to the container's
+    # own loopback interface, so the fake IMDS can bind the same
+    # link-local address a real cloud instance already has configured.
+    extra_capabilities: [NET_ADMIN]
+    ports:
+      - {container_port: 5000}
+      - {container_port: 22}
