@@ -1,0 +1,10 @@
+Handoff notes
+==============
+Still open on this engagement:
+- A service account (look for SPNs on domain accounts) is running
+  with a crackable password -- worth revisiting with a Kerberoasting
+  pass once you're set up for it.
+- svc-helpdesk-lead's own directory "description" field has something
+  else worth reading, if your tools surface it.
+
+Flag: FLAG8_PLACEHOLDER

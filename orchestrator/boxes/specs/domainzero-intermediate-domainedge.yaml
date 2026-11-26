@@ -1,0 +1,23 @@
+box_id: domainzero-intermediate-domainedge
+hosts:
+  - name: dc1
+    image: ctf-boxes/domainzero-intermediate-domainedge:latest
+    front_door: true
+    extra_capabilities: [SYS_ADMIN, NET_ADMIN]
+    # Default (30s) proved too tight on the Docker backend: this box's
+    # real boot sequence (a full AD domain provision + ~20 account
+    # creations) genuinely takes longer than that before the first
+    # front-door port even binds. Confirmed empirically, not padded
+    # defensively -- see registry.py's own comment on this field.
+    readiness_timeout_seconds: 90.0
+    ports:
+      - {container_port: 445}
+      - {container_port: 139}
+      - {container_port: 389}
+      - {container_port: 636}
+      - {container_port: 88}
+      - {container_port: 464}
+      - {container_port: 53}
+      - {container_port: 135}
+      - {container_port: 3268}
+      - {container_port: 3269}

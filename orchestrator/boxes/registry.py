@@ -51,6 +51,25 @@ class HostSpec:
     # container. Meaningless (and never checked) on a box that doesn't set
     # BoxSpec.nested_docker.
     nested_docker: bool = False
+    # Extra Linux capabilities this host's own container needs beyond the
+    # runtime default set -- e.g. domainzero-intermediate-domainedge's
+    # Samba AD DC needs SYS_ADMIN+NET_ADMIN (confirmed empirically via a
+    # pre-build spike: this is enough, full --privileged is NOT needed).
+    # Deliberately separate from NestedDockerSpec.privileged -- that's an
+    # all-or-nothing escape hatch for the one box whose whole design is a
+    # Docker-socket escape; this is for a box that just needs a couple of
+    # named capabilities for an otherwise-ordinary service to run.
+    extra_capabilities: list[str] = field(default_factory=list)
+    # Per-front-door-port readiness-probe timeout -- the Docker backend's
+    # own default (30s) was found too tight for
+    # domainzero-intermediate-domainedge's real boot sequence (a full AD
+    # domain provision + ~20 account creations before samba even starts
+    # listening on anything), confirmed by direct reproduction: the box
+    # was still genuinely booting (reached its own "ready" line) well
+    # after the probe had already given up and torn the instance down.
+    # Same idea as NestedDockerSpec.dockerd_ready_timeout_seconds, just
+    # for the general (non-nested-docker) provisioning path.
+    readiness_timeout_seconds: float = 30.0
 
 
 @dataclass
@@ -108,6 +127,8 @@ def _parse_host(raw: dict) -> HostSpec:
         extra_env=raw.get("extra_env", {}),
         internal_groups=list(raw.get("internal_groups") or ["internal"]),
         nested_docker=raw.get("nested_docker", False),
+        extra_capabilities=list(raw.get("extra_capabilities") or []),
+        readiness_timeout_seconds=float(raw.get("readiness_timeout_seconds", 30.0)),
     )
 
 

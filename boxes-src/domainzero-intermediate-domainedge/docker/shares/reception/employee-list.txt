@@ -1,0 +1,24 @@
+DOMAINZERO -- Active employee usernames (uncontrolled copy)
+=============================================================
+j.alvarez
+p.natarajan
+m.webb
+d.kowalski
+r.chen
+s.okafor
+t.nguyen
+l.fischer
+a.bianchi
+k.oyelaran
+b.santos
+c.wren
+h.park
+f.dubois
+n.ibrahim
+q.delgado
+v.sokolov
+w.tremblay
+z.adeyemi
+y.lindqvist
+
+Directory flag: FLAG2_PLACEHOLDER
