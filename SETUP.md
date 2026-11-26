@@ -59,13 +59,24 @@ sudo apt-get update && sudo apt-get install -y docker.io python3 python3-venv gi
 
 ## 2. Clone and set up the orchestrator
 
+Some newer boxes (everything under `boxes-src/domainzero-*` and
+`boxes-src/cloudbreak-*`) live in their own separate repos, pulled in
+as git submodules -- `--recurse-submodules` (or a separate
+`git submodule update --init` after a plain clone) is required or
+those boxes' `docker/` directories come down empty.
+
 ```
-git clone git@github.com:A3lxq/CTF-orchestrator.git ctf-orchestrator
+git clone --recurse-submodules git@github.com:A3lxq/CTF-orchestrator.git ctf-orchestrator
 cd ctf-orchestrator
 
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python3 --version   # confirm the venv's own interpreter resolves
+```
+
+Already have a clone without submodules initialized?
+```
+git submodule update --init --recursive
 ```
 
 ## 3. Build the box images

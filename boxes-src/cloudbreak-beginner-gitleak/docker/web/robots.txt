@@ -1,3 +1,0 @@
-# FLAG3_PLACEHOLDER
-User-agent: *
-Disallow: /.git/

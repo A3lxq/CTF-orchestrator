@@ -1,0 +1,16 @@
+[submodule "boxes-src/domainzero-noob-reception"]
+	path = boxes-src/domainzero-noob-reception
+	url = git@github.com:A3lxq/domainzero-noob-reception.git
+	branch = CTF_BOXES
+[submodule "boxes-src/cloudbreak-noob-bucket"]
+	path = boxes-src/cloudbreak-noob-bucket
+	url = git@github.com:A3lxq/cloudbreak-noob-bucket.git
+	branch = CTF_BOXES
+[submodule "boxes-src/domainzero-beginner-helpdesk"]
+	path = boxes-src/domainzero-beginner-helpdesk
+	url = git@github.com:A3lxq/domainzero-beginner-helpdesk.git
+	branch = CTF_BOXES
+[submodule "boxes-src/cloudbreak-beginner-gitleak"]
+	path = boxes-src/cloudbreak-beginner-gitleak
+	url = git@github.com:A3lxq/cloudbreak-beginner-gitleak.git
+	branch = CTF_BOXES
