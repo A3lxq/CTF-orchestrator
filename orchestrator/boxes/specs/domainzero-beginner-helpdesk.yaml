@@ -1,0 +1,8 @@
+box_id: domainzero-beginner-helpdesk
+hosts:
+  - name: helpdesk-server
+    image: ctf-boxes/domainzero-beginner-helpdesk:latest
+    front_door: true
+    ports:
+      - {container_port: 22}
+      - {container_port: 5000}
