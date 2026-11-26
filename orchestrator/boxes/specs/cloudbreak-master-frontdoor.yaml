@@ -1,0 +1,22 @@
+box_id: cloudbreak-master-frontdoor
+hosts:
+  - name: frontproxy
+    image: ctf-boxes/cloudbreak-master-frontdoor-frontproxy:latest
+    front_door: true
+    ports:
+      - {container_port: 80}
+      # Blind TCP relay to admin-api:22 (see docker/frontproxy/app.py) --
+      # this box's one and only front door also doubles as the bastion
+      # for the SSH foothold, since admin-api never gets a published
+      # port of its own.
+      - {container_port: 2222}
+  - name: admin-api
+    image: ctf-boxes/cloudbreak-master-frontdoor-admin-api:latest
+    front_door: false
+    # Unused by DockerBackend for internal-only hosts (intra-bridge
+    # traffic needs no explicit publish), but required by
+    # KubernetesBackend -- a Service routes only the ports it's told
+    # about, unlike a Docker bridge network.
+    ports:
+      - {container_port: 8000}
+      - {container_port: 22}
