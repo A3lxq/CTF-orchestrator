@@ -1,9 +1,0 @@
-====================================================================
-MERIDIAN SYSTEMS -- Domain Edge File Server
-====================================================================
-Internal reference material for the DOMAINZERO domain. If you can
-read this anonymously, that part of the deployment is working as
-documented (unfortunately).
-
-Recon flag: FLAG1_PLACEHOLDER
-====================================================================

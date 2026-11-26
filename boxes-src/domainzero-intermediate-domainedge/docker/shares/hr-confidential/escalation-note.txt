@@ -1,9 +1,0 @@
-On-call escalation account
-===========================
-username: svc-helpdesk-lead
-password: Triage-OnCall-2024!
-
-This account has access to the it-admin-drop share. Treat it
-carefully -- it's shared across the whole on-call rotation.
-
-Flag: FLAG6_PLACEHOLDER

@@ -14,3 +14,7 @@
 	path = boxes-src/cloudbreak-beginner-gitleak
 	url = git@github.com:A3lxq/cloudbreak-beginner-gitleak.git
 	branch = CTF_BOXES
+[submodule "boxes-src/domainzero-intermediate-domainedge"]
+	path = boxes-src/domainzero-intermediate-domainedge
+	url = git@github.com:A3lxq/domainzero-intermediate-domainedge.git
+	branch = CTF_BOXES
