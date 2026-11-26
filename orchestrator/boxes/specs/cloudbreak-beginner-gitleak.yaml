@@ -1,0 +1,8 @@
+box_id: cloudbreak-beginner-gitleak
+hosts:
+  - name: web-server
+    image: ctf-boxes/cloudbreak-beginner-gitleak:latest
+    front_door: true
+    ports:
+      - {container_port: 22}
+      - {container_port: 80}
