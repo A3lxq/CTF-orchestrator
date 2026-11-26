@@ -30,6 +30,11 @@ ALL_BOX_IDS = {
     "god-the-ferryman",
     "legendary-ferrymans-relay",
 }
+# Not exhaustive: more boxes (bonus-*, domainzero-*, cloudbreak-*) have
+# been registered since this file was written. Checked as a subset
+# below rather than exact equality, so this file doesn't need editing
+# every time a new box is added -- it only needs to prove the original
+# 8 are still present/registered correctly.
 
 # Four single-host boxes -- fastest to provision/destroy, used to fill
 # (and stay at) the quota without the multi-host/nested-docker boxes'
@@ -52,7 +57,7 @@ def test_get_boxes_lists_all_known_boxes():
     r.raise_for_status()
     boxes = r.json()
     box_ids = {b["box_id"] for b in boxes}
-    assert box_ids == ALL_BOX_IDS
+    assert ALL_BOX_IDS <= box_ids
 
     by_id = {b["box_id"]: b for b in boxes}
     noob = by_id["noob-orientation-server"]
