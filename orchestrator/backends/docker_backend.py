@@ -40,6 +40,29 @@ class DockerBackend(RuntimeBackend):
         # with Docker's own "port is already allocated" error).
         self._alloc_lock = threading.Lock()
 
+    def _reload_with_retry(self, container, attempts: int = 5, delay: float = 0.3) -> None:
+        """container.reload() on a container this call itself just
+        created+started can transiently 404 ("No such container") when a
+        create happens shortly after an unrelated container on this same
+        host was just force-removed -- confirmed by two independent
+        reproductions (different boxes, neither using nested_docker, host
+        load otherwise idle) as a real Docker-daemon-level eventual-
+        consistency gap, not a bug in how this container was named/
+        created/started. Retrying briefly is the correct fix: the
+        container this method is called on definitely exists (we hold a
+        reference to the object this process itself just started), so a
+        NotFound here is always transient, never a real "it's gone"."""
+        last_exc: NotFound | None = None
+        for attempt in range(attempts):
+            try:
+                container.reload()
+                return
+            except NotFound as e:
+                last_exc = e
+                if attempt < attempts - 1:
+                    time.sleep(delay)
+        raise last_exc
+
     def _used_host_ports(self) -> set[int]:
         """Ports currently bound by ANY container on this host, derived
         from live Docker state rather than in-memory bookkeeping, so this
@@ -130,7 +153,7 @@ class DockerBackend(RuntimeBackend):
                 used_ports=used_ports,
             )
             host_containers[host_spec.name] = container
-            container.reload()
+            self._reload_with_retry(container)
             internal_ip = None
             net_settings = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             # Prefer an internal network's IP when this host is a member of
@@ -313,7 +336,7 @@ class DockerBackend(RuntimeBackend):
 
         BRING_UPS[spec.box_id](lambda cmd: container.exec_run(cmd), team_secret, images)
 
-        container.reload()
+        self._reload_with_retry(container)
         ports = container.attrs.get("NetworkSettings", {}).get("Ports") or {}
         front_door_host_port: int | None = None
         front_door_all_host_ports: list[int] = []
