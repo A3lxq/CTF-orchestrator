@@ -1,0 +1,9 @@
+# Legacy SAM-style credential dump, last touched during the backoffice
+# migration. Should have been deleted, wasn't. Classic hash-dump format
+# (username:RID:LM-hash:NTLM-hash:::). The LM hash below is the standard
+# "empty/disabled" constant (aad3b435b51404eeaad3b435b51404ee) -- it does
+# NOT mean the password is blank, it means LM hashing is simply off, same
+# as on any modern Windows host.
+#
+# Flag: FLAG3_PLACEHOLDER
+svc-backoffice:1105:aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c:::

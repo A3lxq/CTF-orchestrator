@@ -1,0 +1,46 @@
+box_id: domainzero-master-twosites
+hosts:
+  - name: frontdesk
+    image: ctf-boxes/domainzero-master-twosites-frontdesk:latest
+    front_door: true
+    extra_capabilities: [SYS_ADMIN, NET_ADMIN]
+    # Same real Samba AD DC provisioning sequence as
+    # domainzero-intermediate-domainedge -- default (30s) readiness proved
+    # too tight there for the same reason it would be here: a full AD
+    # domain provision genuinely takes longer than that before the first
+    # front-door port even binds. Reusing that box's own confirmed value
+    # rather than re-deriving it.
+    readiness_timeout_seconds: 90.0
+    ports:
+      - {container_port: 445}
+      - {container_port: 139}
+      - {container_port: 389}
+      - {container_port: 636}
+      - {container_port: 88}
+      - {container_port: 464}
+      - {container_port: 53}
+      - {container_port: 135}
+      - {container_port: 3268}
+      - {container_port: 3269}
+      # DESIGN FIX: backoffice has no published port of its own (no
+      # front_door, so DockerBackend never publishes anything for it,
+      # and KubernetesBackend only gives it a ClusterIP) -- without a
+      # relay, a real external player who steals a credential for it
+      # would have no network path there at all, breaking this
+      # project's "solvable over published ports alone" invariant.
+      # frontdesk runs a tiny protocol-unaware TCP relay (tcp_relay.py)
+      # alongside Samba: 2222 -> backoffice:22 (SSH), 4000 ->
+      # backoffice:4000 (the GraphQL API) -- the real "bastion/jump
+      # host" pattern actual AD environments use.
+      - {container_port: 2222}
+      - {container_port: 4000}
+  - name: backoffice
+    image: ctf-boxes/domainzero-master-twosites-backoffice:latest
+    front_door: false
+    # Unused by DockerBackend for internal-only hosts (intra-bridge
+    # traffic needs no explicit publish), but required by
+    # KubernetesBackend -- a Service routes only the ports it's told
+    # about, unlike a Docker bridge network. Same as master-two-offices.
+    ports:
+      - {container_port: 4000}
+      - {container_port: 22}
