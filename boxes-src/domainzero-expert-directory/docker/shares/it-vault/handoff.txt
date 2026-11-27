@@ -1,0 +1,9 @@
+IT Vault -- escalation-tier notes
+===================================
+This share holds the more sensitive side of what svc-reports can
+reach -- directory content Finance exports touch but shouldn't
+really be this exposed.
+
+Flag: FLAG8_PLACEHOLDER
+
+See closing-note.txt before you wrap up this engagement.

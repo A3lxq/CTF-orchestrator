@@ -1,0 +1,46 @@
+box_id: domainzero-expert-directory
+hosts:
+  - name: directory
+    image: ctf-boxes/domainzero-expert-directory-directory:latest
+    front_door: true
+    extra_capabilities: [SYS_ADMIN, NET_ADMIN]
+    # Same real AD-provision boot sequence as domainzero-intermediate-
+    # domainedge (this box's own entrypoint.sh copies that box's
+    # provisioning approach closely), plus this tier's extra account/ACE/
+    # LDAP-attribute setup on top -- confirmed empirically to still fit
+    # comfortably inside domainedge's own 90s budget during manual testing,
+    # so reused as-is rather than re-deriving a new number.
+    readiness_timeout_seconds: 90.0
+    ports:
+      - {container_port: 445}
+      - {container_port: 139}
+      - {container_port: 389}
+      - {container_port: 636}
+      - {container_port: 88}
+      - {container_port: 464}
+      - {container_port: 53}
+      - {container_port: 135}
+      - {container_port: 3268}
+      - {container_port: 3269}
+      # A plain TCP relay (docker/directory/tcp_relay.py) onto
+      # search-intranet:5000. search-intranet is internal-only/never
+      # published below -- without this, a real external player (who
+      # only ever gets this box's published ports, never a route onto
+      # the per-instance internal bridge network itself) would have no
+      # way to reach flags 3-4 at all. Same fix this project's other
+      # boxes with an internal-only HTTP host already apply.
+      - {container_port: 8080}
+  - name: search-intranet
+    image: ctf-boxes/domainzero-expert-directory-search-intranet:latest
+    front_door: false
+    # Unused by DockerBackend for internal-only hosts (intra-bridge traffic
+    # needs no explicit publish), but required by KubernetesBackend -- a
+    # Service routes only the ports it's told about, unlike a Docker
+    # bridge network. Same note as master-two-offices's own backoffice host.
+    ports:
+      - {container_port: 5000}
+    # No internal_groups set on either host -- both default to the single
+    # shared group "internal" (see registry.py's HostSpec.internal_groups),
+    # which is exactly the flat, one-segment topology this box needs:
+    # "directory" reaches "search-intranet" by that alias, nothing more
+    # elaborate than master-two-offices's own frontdesk/backoffice pair.
