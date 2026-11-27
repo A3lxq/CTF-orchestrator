@@ -18,3 +18,23 @@
 	path = boxes-src/domainzero-intermediate-domainedge
 	url = git@github.com:A3lxq/domainzero-intermediate-domainedge.git
 	branch = CTF_BOXES
+[submodule "boxes-src/cloudbreak-veteran-layers"]
+	path = boxes-src/cloudbreak-veteran-layers
+	url = git@github.com:A3lxq/cloudbreak-veteran-layers.git
+	branch = CTF_BOXES
+[submodule "boxes-src/domainzero-master-twosites"]
+	path = boxes-src/domainzero-master-twosites
+	url = git@github.com:A3lxq/domainzero-master-twosites.git
+	branch = CTF_BOXES
+[submodule "boxes-src/cloudbreak-master-frontdoor"]
+	path = boxes-src/cloudbreak-master-frontdoor
+	url = git@github.com:A3lxq/cloudbreak-master-frontdoor.git
+	branch = CTF_BOXES
+[submodule "boxes-src/domainzero-expert-directory"]
+	path = boxes-src/domainzero-expert-directory
+	url = git@github.com:A3lxq/domainzero-expert-directory.git
+	branch = CTF_BOXES
+[submodule "boxes-src/cloudbreak-intermediate-metadata"]
+	path = boxes-src/cloudbreak-intermediate-metadata
+	url = git@github.com:A3lxq/cloudbreak-intermediate-metadata.git
+	branch = CTF_BOXES
