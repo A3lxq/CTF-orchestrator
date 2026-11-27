@@ -445,6 +445,15 @@ def test_idempotent_create(box_instance):
 
 def test_cross_team_flag_isolation(box_instance):
     inst, secret, backend = box_instance
+    # _smb_get/_smb_run hardcode 127.0.0.1 as the target host (reachable
+    # for the Docker backend, whose entry_host genuinely is 127.0.0.1 --
+    # not for Kubernetes, whose entry_host is the real kind-node
+    # address). Every other kubernetes-exercising test in this file is
+    # already deliberately skipped for the same reason (Docker-backend
+    # verification only for this pass); this one needs the same guard,
+    # it's just the one that doesn't also depend on LDAP/the relay so it
+    # was easy to miss.
+    _require_docker(backend)
     team_id_b = inst["team_id"] + 1000
     secret_b = pysecrets.token_hex(32)
     inst_b = _create_instance(team_id_b, secret_b, backend)
