@@ -22,6 +22,14 @@ hosts:
       - {container_port: 135}
       - {container_port: 3268}
       - {container_port: 3269}
+      # A plain TCP relay (docker/directory/tcp_relay.py) onto
+      # search-intranet:5000. search-intranet is internal-only/never
+      # published below -- without this, a real external player (who
+      # only ever gets this box's published ports, never a route onto
+      # the per-instance internal bridge network itself) would have no
+      # way to reach flags 3-4 at all. Same fix this project's other
+      # boxes with an internal-only HTTP host already apply.
+      - {container_port: 8080}
   - name: search-intranet
     image: ctf-boxes/domainzero-expert-directory-search-intranet:latest
     front_door: false

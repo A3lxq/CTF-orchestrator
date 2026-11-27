@@ -145,11 +145,21 @@ def _docker_exec(container_name: str, *cmd: str) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", "exec", container_name, *cmd], capture_output=True, text=True)
 
 
-def _run_helper(script: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
+def _run_helper(script: str, timeout: float = 120.0) -> subprocess.CompletedProcess:
     """Runs `script` inside a disposable alpine container on the HOST's
     own network namespace (so "127.0.0.1:<published-port>" reaches this
     orchestrator's published ports, same as a real player's own tools
-    would from their own machine)."""
+    would from their own machine).
+
+    120s (not a tighter bound) because this is a shared, multi-tenant
+    Docker host -- `apk add` plus `docker run --rm`'s own container
+    teardown can occasionally take longer than the helper script itself
+    under contention from other concurrent work on the same daemon.
+    Confirmed by direct reproduction: a run that hit this ceiling had
+    already produced the correct, complete output in its captured stdout
+    well before the timeout fired -- the slowness is in the disposable
+    container's own startup/teardown, never in whether the real
+    smbclient/ldapsearch/ldapmodify call itself succeeded."""
     return subprocess.run(
         ["docker", "run", "--rm", "--network", "host", HELPER_IMAGE, "sh", "-c", script],
         capture_output=True, text=True, timeout=timeout,
@@ -325,7 +335,7 @@ def _require_docker(backend: str):
 def test_full_ten_flag_chain(box_instance):
     inst, secret, backend = box_instance
     _require_docker(backend)
-    team_id = inst["team_id"]
+    host = inst["entry_host"]
     smb_port, ldaps_port = _port(inst, 445), _port(inst, 636)
 
     # Flags 1-2: anonymous SMB recon on "directory"'s staff-notices share.
@@ -336,12 +346,13 @@ def test_full_ten_flag_chain(box_instance):
     assert "search-intranet" in rollout  # the pointer to host B
 
     # Flag 3: recon on search-intranet's own page. It has no published
-    # port (internal-only) -- reached the same way "directory" itself
-    # reaches it, over the shared internal network, by its container IP
-    # (an "internal: true" Docker network still routes from the host
-    # itself -- it just isn't published/NAT'd for outside traffic).
-    search_ip = _container_ip(_internal_container(team_id, "search-intranet"))
-    search_base = f"http://{search_ip}:5000"
+    # port at all (internal-only) -- a real player reaches it only
+    # through "directory"'s own TCP relay (tcp_relay.py, a plain
+    # protocol-unaware socket splice onto search-intranet:5000), over
+    # THIS box's own published port, exactly the way a real player would
+    # (never via a Docker-internal IP they'd have no route to at all).
+    relay_port = _port(inst, 8080)
+    search_base = f"http://{host}:{relay_port}"
     docs = requests.get(f"{search_base}/", timeout=10).text
     assert expected_flag(secret, 3) in docs
 
@@ -414,8 +425,11 @@ def test_force_change_password_is_genuinely_scoped(box_instance):
     inst, secret, backend = box_instance
     _require_docker(backend)
     ldaps_port = _port(inst, 636)
-    search_ip = _container_ip(_internal_container(inst["team_id"], "search-intranet"))
-    injected = requests.post(f"http://{search_ip}:5000/login", json={"username": "jcarter", "password": {"$ne": None}}, timeout=10)
+    relay_port = _port(inst, 8080)
+    injected = requests.post(
+        f"http://{inst['entry_host']}:{relay_port}/login",
+        json={"username": "jcarter", "password": {"$ne": None}}, timeout=10,
+    )
     jcarter_password = injected.json()["directory_password"]
 
     ok, raw = _ldap_reset_password(ldaps_port, JCARTER_USER, jcarter_password, "Administrator", "ShouldNeverWork-123!")

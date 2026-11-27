@@ -77,6 +77,19 @@ samba-tool dsacl set \
 
 # --- Start samba once so LDAPS is reachable for the attribute writes ---
 samba -i &
+SAMBA_PID=$!
+
+# --- The TCP relay onto search-intranet:5000 (see tcp_relay.py's own
+# docstring for why this needs to exist at all: search-intranet is
+# internal-only/never published, so without this a real player has no
+# published-port path to flags 3-4 at all). Started early/independently
+# of samba's own readiness -- it only resolves "search-intranet" and
+# connects per-incoming-connection, not at startup, so it's fine to be
+# listening before that host is actually ready. Explicitly NOT part of
+# the `wait` below -- this backgrounds forever, and the container's
+# lifecycle is tied to samba, not to this relay.
+python3 /opt/tcp_relay.py &
+
 echo "[*] Waiting for samba to come up..."
 for i in $(seq 1 30); do
     if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/389" 2>/dev/null; then break; fi
@@ -175,4 +188,8 @@ EOF
 smbcontrol all reload-config >/dev/null 2>&1 || true
 
 echo "[*] domainzero-expert-directory (directory host) ready."
-wait -n
+# Wait specifically on samba's own PID (not `wait -n`, and not a bare
+# `wait`) -- the relay above is also backgrounded, and this container's
+# lifecycle must track samba, not whichever background job happens to
+# exit first.
+wait "${SAMBA_PID}"
