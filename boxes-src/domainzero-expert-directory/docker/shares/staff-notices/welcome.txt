@@ -1,0 +1,10 @@
+====================================================================
+MERIDIAN SYSTEMS -- Directory File Server (anonymous notices share)
+====================================================================
+Welcome to the Meridian Systems corporate directory. This share is
+intentionally left world-readable for staff onboarding notices.
+
+If you can read this anonymously, recon has started.
+
+Recon flag: FLAG1_PLACEHOLDER
+====================================================================

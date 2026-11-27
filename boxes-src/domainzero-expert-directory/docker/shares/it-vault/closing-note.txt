@@ -1,0 +1,8 @@
+Closing note
+=============
+Still open on this engagement:
+- Check the "Domain Admins" group's own directory attributes (its
+  `info` field, over an authenticated LDAP bind) -- there's a
+  closing note on it worth reading once you've gotten this far.
+
+Flag: FLAG9_PLACEHOLDER
